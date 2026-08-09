@@ -347,7 +347,6 @@ The Flask Web Dashboard provides comprehensive SOC visibility:
 | Name | Roll Number | Primary Responsibilities |
 | :--- | :--- | :--- |
 | **Clemant Mathew Jiji** | *SJC22CS045* | Team Lead & Lead Developer (Twisted Core, Adaptive Deception, Docker) |
-| **Amal K** | *SJC22CS023* | Security Researcher & Data Specialist (SQLite Engine, Threat Intel, Dashboard) |
 
 ---
 
@@ -372,7 +371,7 @@ If you use AegisFTP in academic research or capstone projects, please cite this 
 ```bibtex
 @techreport{aegisftp2026,
   title       = {AegisFTP: Adaptive Medium-High Interaction FTP Honeypot for Threat Intelligence},
-  author      = {Clemant Mathew Jiji and Amal K},
+  author      = {Clemant Mathew Jiji},
   institution = {St. Joseph's College of Engineering \& Technology, Palai},
   department  = {Department of Computer Science \& Engineering (Cyber Security)},
   year        = {2026},
