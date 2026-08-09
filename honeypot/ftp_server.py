@@ -13,6 +13,10 @@ from honeypot.config import (
 )
 from honeypot.database import db
 from honeypot.virtual_fs import VirtualFileSystem
+from honeypot.adaptive import adaptive_engine
+from honeypot.mitre_mapper import mitre_mapper
+from honeypot.threat_intel import threat_intel
+from honeypot.alerting import alert_notifier
 
 # Shared Virtual Filesystem instance across sessions
 vfs = VirtualFileSystem()
@@ -58,12 +62,14 @@ class FTPControlProtocol(LineReceiver):
         self.session_id = str(uuid.uuid4())
         self.client_ip = "0.0.0.0"
         self.client_port = 0
+        self.geo_info = {}
         self.authenticated = False
         self.authenticated_user = None
         self.username = None
         self.failed_attempts = 0
         self.cwd = "/var/www"
-        self.transfer_type = "I"  # Binary default
+        self.transfer_type = "I"
+        self.has_uploaded = False
         self.pasv_listener = None
         self.pasv_port = None
         self.pasv_factory = None
@@ -75,9 +81,19 @@ class FTPControlProtocol(LineReceiver):
         self.client_ip = peer.host
         self.client_port = peer.port
         
+        # Enhanced Detection: GeoIP & AbuseIPDB Lookup
+        self.geo_info = threat_intel.lookup_geoip(self.client_ip)
+        abuse_data = threat_intel.check_abuseipdb(self.client_ip)
+
         # Log session in database
-        db.create_session(self.session_id, self.client_ip, self.client_port)
+        db.create_session(
+            self.session_id, self.client_ip, self.client_port,
+            geo_info=self.geo_info, abuse_score=abuse_data.get("abuse_score", 0)
+        )
         
+        # Real-time Alerting
+        alert_notifier.notify_new_connection(self.client_ip, self.geo_info)
+
         # Send Welcome Banner
         self.send_response(FTP_WELCOME_BANNER)
 
@@ -98,7 +114,20 @@ class FTPControlProtocol(LineReceiver):
         command = parts[0].upper()
         args = parts[1] if len(parts) > 1 else ""
 
-        # Dispatch command
+        # Adaptive Deception Engine Evaluation (Tarpit delay & Dynamic honeypot asset injection)
+        adaptive_eval = adaptive_engine.evaluate_response(
+            self.session_id, command, args, vfs, self.has_uploaded
+        )
+
+        delay = adaptive_eval.get("delay_seconds", 0.0)
+
+        # Dispatch command with optional tarpit delay
+        if delay > 0:
+            reactor.callLater(delay, self._dispatch_command, command, args)
+        else:
+            self._dispatch_command(command, args)
+
+    def _dispatch_command(self, command, args):
         handler_name = f"ftp_{command}"
         if hasattr(self, handler_name):
             handler = getattr(self, handler_name)
@@ -114,7 +143,12 @@ class FTPControlProtocol(LineReceiver):
                 code = 200
 
         if command:
-            db.log_command(self.session_id, self.client_ip, command, args, code)
+            # MITRE ATT&CK Classification
+            tags = mitre_mapper.classify_command(
+                command, args, self.failed_attempts, self.client_ip, self.active_host
+            )
+            mitre_str = ",".join([t["technique_id"] for t in tags])
+            db.log_command(self.session_id, self.client_ip, command, args, code, mitre_str)
 
         self.sendLine(response_text.encode('utf-8'))
 
@@ -147,6 +181,11 @@ class FTPControlProtocol(LineReceiver):
             self.authenticated_user = self.username or "anonymous"
             db.log_auth_attempt(self.session_id, self.client_ip, self.username or "unknown", password, True, self.failed_attempts)
             db.update_session_auth(self.session_id, self.failed_attempts, self.authenticated_user)
+            
+            # Send real-time webhook alert
+            alert_notifier.notify_brute_force_threshold(
+                self.client_ip, self.failed_attempts, self.username or "unknown", password
+            )
             self.send_response("230 User logged in, proceed.", "PASS", "******", 230)
 
     def ftp_SYST(self, args):
@@ -211,7 +250,6 @@ class FTPControlProtocol(LineReceiver):
             except Exception:
                 return None
 
-        # Try allocated port range
         listener_info = None
         for p in range(PASV_PORT_MIN, PASV_PORT_MAX + 1):
             res = try_listen(p)
@@ -220,7 +258,6 @@ class FTPControlProtocol(LineReceiver):
                 break
 
         if not listener_info:
-            # Fallback to ephemeral port 0
             res = try_listen(0)
             if res:
                 listener_info = res
@@ -229,25 +266,21 @@ class FTPControlProtocol(LineReceiver):
             self.send_response("425 Can't open data connection.", "PASV", args, 425)
             return
 
-        # Deferred listener creation
         def on_listen_success(port_object):
             self.pasv_listener = port_object
             self.pasv_port = port_object.getHost().port
             
-            # Format PASV response tuple
             ip_parts = (FTP_HOST if FTP_HOST != "0.0.0.0" else "127.0.0.1").split(".")
             p1 = self.pasv_port // 256
             p2 = self.pasv_port % 256
             pasv_str = f"227 Entering Passive Mode ({ip_parts[0]},{ip_parts[1]},{ip_parts[2]},{ip_parts[3]},{p1},{p2})."
             self.send_response(pasv_str, "PASV", args, 227)
 
-        # Handle async endpoint listen result
         listener_deferred = listener_info[0]
         if isinstance(listener_deferred, defer.Deferred):
             self.pasv_factory = listener_info[1]
             listener_deferred.addCallback(on_listen_success)
         else:
-            # Synchronous return
             self.pasv_listener = listener_info[0]
             self.pasv_factory = listener_info[1]
             on_listen_success(listener_info[0])
@@ -257,8 +290,16 @@ class FTPControlProtocol(LineReceiver):
             parts = args.strip().split(",")
             if len(parts) != 6:
                 raise ValueError
-            self.active_host = ".".join(parts[:4])
-            self.active_port = int(parts[4]) * 256 + int(parts[5])
+            candidate_host = ".".join(parts[:4])
+            candidate_port = int(parts[4]) * 256 + int(parts[5])
+
+            # Enhanced Detection: FTP Bounce Attack Prevention
+            if threat_intel.check_ftp_bounce(self.client_ip, candidate_host):
+                self.send_response("501 Illegal PORT command (FTP Bounce Attack detected).", "PORT", args, 501)
+                return
+
+            self.active_host = candidate_host
+            self.active_port = candidate_port
             self.send_response("200 PORT command successful.", "PORT", args, 200)
         except Exception:
             self.send_response("501 Illegal PORT command.", "PORT", args, 501)
@@ -286,7 +327,6 @@ class FTPControlProtocol(LineReceiver):
 
         target = args.strip()
         if target.startswith("-"):
-            # Handle flags like -la
             parts = target.split()
             target = parts[-1] if len(parts) > 1 and not parts[-1].startswith("-") else ""
 
@@ -385,6 +425,10 @@ class FTPControlProtocol(LineReceiver):
             with open(quarantine_path, "wb") as f:
                 f.write(received_bytes)
 
+            # Enhanced Detection: YARA Rule Scanner
+            yara_matches = threat_intel.scan_yara_rules(quarantine_path)
+            yara_str = ",".join(yara_matches)
+
             # Log payload in SQLite database
             db.log_quarantined_file(
                 self.session_id,
@@ -392,11 +436,18 @@ class FTPControlProtocol(LineReceiver):
                 safe_basename,
                 quarantine_filename,
                 len(received_bytes),
-                sha256_hash
+                sha256_hash,
+                yara_str
             )
 
             # Add to Virtual Filesystem dynamically
             vfs.add_file(vfs_path, received_bytes, owner=self.authenticated_user or "www-data")
+            self.has_uploaded = True
+
+            # Real-time Webhook Alerting
+            alert_notifier.notify_payload_uploaded(
+                self.client_ip, safe_basename, sha256_hash, len(received_bytes), self.geo_info, yara_matches
+            )
 
             self.send_response("226 File receive OK.", "STOR", args, 226)
             self.close_pasv_listener()

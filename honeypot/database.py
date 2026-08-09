@@ -20,17 +20,23 @@ class DatabaseManager:
             conn = self.get_connection()
             cursor = conn.cursor()
             
-            # Sessions table
+            # Sessions table with GeoIP & AbuseIPDB metrics
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
                     client_ip TEXT NOT NULL,
                     client_port INTEGER NOT NULL,
+                    country TEXT DEFAULT 'Unknown',
+                    country_code TEXT DEFAULT 'XX',
+                    city TEXT DEFAULT 'Unknown',
+                    isp TEXT DEFAULT 'Unknown',
+                    abuse_score INTEGER DEFAULT 0,
                     start_time TEXT NOT NULL,
                     end_time TEXT,
                     failed_attempts INTEGER DEFAULT 0,
                     authenticated_user TEXT,
-                    status TEXT DEFAULT 'ACTIVE'
+                    status TEXT DEFAULT 'ACTIVE',
+                    mitre_tags TEXT DEFAULT ''
                 )
             """)
             
@@ -49,7 +55,7 @@ class DatabaseManager:
                 )
             """)
             
-            # Command logs table
+            # Command logs table with MITRE technique mapping
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS command_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,11 +65,12 @@ class DatabaseManager:
                     command TEXT NOT NULL,
                     arguments TEXT,
                     response_code INTEGER,
+                    mitre_technique TEXT DEFAULT '',
                     FOREIGN KEY (session_id) REFERENCES sessions (session_id)
                 )
             """)
             
-            # Quarantined files table
+            # Quarantined files table with YARA scan matches
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS quarantined_files (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,6 +81,7 @@ class DatabaseManager:
                     file_size INTEGER NOT NULL,
                     sha256_hash TEXT NOT NULL,
                     upload_timestamp TEXT NOT NULL,
+                    yara_matches TEXT DEFAULT '',
                     FOREIGN KEY (session_id) REFERENCES sessions (session_id)
                 )
             """)
@@ -81,15 +89,21 @@ class DatabaseManager:
             conn.commit()
             conn.close()
 
-    def create_session(self, session_id, client_ip, client_port):
+    def create_session(self, session_id, client_ip, client_port, geo_info=None, abuse_score=0):
         now = datetime.datetime.utcnow().isoformat()
+        geo = geo_info or {}
         with self._lock:
             conn = self.get_connection()
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO sessions (session_id, client_ip, client_port, start_time, failed_attempts, status)
-                VALUES (?, ?, ?, ?, 0, 'ACTIVE')
-            """, (session_id, client_ip, client_port, now))
+                INSERT INTO sessions (session_id, client_ip, client_port, country, country_code, city, isp, abuse_score, start_time, failed_attempts, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'ACTIVE')
+            """, (
+                session_id, client_ip, client_port,
+                geo.get("country", "Unknown"), geo.get("country_code", "XX"),
+                geo.get("city", "Unknown"), geo.get("isp", "Unknown"),
+                abuse_score, now
+            ))
             conn.commit()
             conn.close()
 
@@ -109,6 +123,14 @@ class DatabaseManager:
                     SET failed_attempts = ? 
                     WHERE session_id = ?
                 """, (failed_attempts, session_id))
+            conn.commit()
+            conn.close()
+
+    def update_session_mitre_tags(self, session_id, tags_str):
+        with self._lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE sessions SET mitre_tags = ? WHERE session_id = ?", (tags_str, session_id))
             conn.commit()
             conn.close()
 
@@ -137,27 +159,27 @@ class DatabaseManager:
             conn.commit()
             conn.close()
 
-    def log_command(self, session_id, client_ip, command, arguments, response_code=None):
+    def log_command(self, session_id, client_ip, command, arguments, response_code=None, mitre_technique=""):
         now = datetime.datetime.utcnow().isoformat()
         with self._lock:
             conn = self.get_connection()
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO command_logs (session_id, client_ip, timestamp, command, arguments, response_code)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (session_id, client_ip, now, command, arguments, response_code))
+                INSERT INTO command_logs (session_id, client_ip, timestamp, command, arguments, response_code, mitre_technique)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (session_id, client_ip, now, command, arguments, response_code, mitre_technique))
             conn.commit()
             conn.close()
 
-    def log_quarantined_file(self, session_id, client_ip, original_filename, quarantine_filename, file_size, sha256_hash):
+    def log_quarantined_file(self, session_id, client_ip, original_filename, quarantine_filename, file_size, sha256_hash, yara_matches=""):
         now = datetime.datetime.utcnow().isoformat()
         with self._lock:
             conn = self.get_connection()
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO quarantined_files (session_id, client_ip, original_filename, quarantine_filename, file_size, sha256_hash, upload_timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (session_id, client_ip, original_filename, quarantine_filename, file_size, sha256_hash, now))
+                INSERT INTO quarantined_files (session_id, client_ip, original_filename, quarantine_filename, file_size, sha256_hash, upload_timestamp, yara_matches)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (session_id, client_ip, original_filename, quarantine_filename, file_size, sha256_hash, now, yara_matches))
             conn.commit()
             conn.close()
 
