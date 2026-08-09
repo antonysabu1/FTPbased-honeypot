@@ -341,12 +341,12 @@ The Flask Web Dashboard provides comprehensive SOC visibility:
 *Palai, Kerala, India*
 
 ### Project Guidance
-- **Project Guide**: **Prof. Sabarinath G Pillai** (Assistant Professor, Department of CSE)
+- **Project Guide**: **Prof. Sabarinath G Pillai** (Assistant Professor, Department of CSE (Cyber Security))
 
 ### Project Team Members
 | Name | Roll Number | Primary Responsibilities |
 | :--- | :--- | :--- |
-| **Clemant Mathew Jiji** | *SJC22CS045* | Team Lead & Lead Developer (Twisted Core, Adaptive Deception, Docker) |
+| **Clemant Mathew Jiji** | *SJC23CC031* | Team Lead & Lead Developer (Twisted Core, Adaptive Deception, Docker) |
 
 ---
 
