@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  ftp-honeypot:
+    build: .
+    container_name: aegis_ftp_honeypot
+    restart: always
+    ports:
+      - "21:21"
+      - "5000:5000"
+      - "50000-50010:50000-50010"
+    environment:
+      - FTP_HOST=0.0.0.0
+      - FTP_PORT=21
+      - FAILED_ATTEMPTS_THRESHOLD=3
+      - DASHBOARD_HOST=0.0.0.0
+      - DASHBOARD_PORT=5000
+    volumes:
+      - ./data:/app/data
+      - ./quarantine:/app/quarantine

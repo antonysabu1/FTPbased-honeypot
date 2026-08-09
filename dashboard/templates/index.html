@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AegisFTP - High Interaction FTP Honeypot Dashboard</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- Font Awesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Top Navigation Header -->
+        <header class="navbar">
+            <div class="brand">
+                <div class="shield-icon">
+                    <i class="fa-solid fa-shield-halved"></i>
+                </div>
+                <div class="brand-text">
+                    <h1>AegisFTP <span class="badge-live"><span class="pulse"></span> LIVE</span></h1>
+                    <p class="subtitle">High-Interaction Twisted FTP Honeypot & Intelligence Sensor</p>
+                </div>
+            </div>
+            <div class="header-actions">
+                <div class="auto-refresh">
+                    <i class="fa-solid fa-sync fa-spin-pulse" id="sync-icon"></i>
+                    <span>Auto-refresh <strong id="refresh-counter">5s</strong></span>
+                </div>
+                <button class="btn-refresh" id="btn-manual-refresh">
+                    <i class="fa-solid fa-rotate-right"></i> Refresh
+                </button>
+            </div>
+        </header>
+
+        <!-- Main Content Area -->
+        <main class="dashboard-body">
+            <!-- Metrics Cards Grid -->
+            <section class="stats-grid">
+                <div class="stat-card card-sessions">
+                    <div class="stat-icon"><i class="fa-solid fa-network-wired"></i></div>
+                    <div class="stat-info">
+                        <span class="stat-label">Total Sessions</span>
+                        <h2 class="stat-value" id="stat-total-sessions">0</h2>
+                        <span class="stat-sub"><strong id="stat-active-sessions">0</strong> Active Now</span>
+                    </div>
+                </div>
+
+                <div class="stat-card card-auth">
+                    <div class="stat-icon"><i class="fa-solid fa-key"></i></div>
+                    <div class="stat-info">
+                        <span class="stat-label">Auth Attempts</span>
+                        <h2 class="stat-value" id="stat-auth-attempts">0</h2>
+                        <span class="stat-sub">Logged Credentials</span>
+                    </div>
+                </div>
+
+                <div class="stat-card card-commands">
+                    <div class="stat-icon"><i class="fa-solid fa-terminal"></i></div>
+                    <div class="stat-info">
+                        <span class="stat-label">FTP Commands</span>
+                        <h2 class="stat-value" id="stat-total-commands">0</h2>
+                        <span class="stat-sub">Interactions Recorded</span>
+                    </div>
+                </div>
+
+                <div class="stat-card card-uploads">
+                    <div class="stat-icon"><i class="fa-solid fa-box-archive"></i></div>
+                    <div class="stat-info">
+                        <span class="stat-label">Quarantined Files</span>
+                        <h2 class="stat-value" id="stat-total-uploads">0</h2>
+                        <span class="stat-sub">Payloads Captured</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Navigation Tabs & Search bar -->
+            <div class="panel-header-controls">
+                <nav class="nav-tabs">
+                    <button class="tab-btn active" data-tab="tab-sessions">
+                        <i class="fa-solid fa-users"></i> Sessions
+                    </button>
+                    <button class="tab-btn" data-tab="tab-auth">
+                        <i class="fa-solid fa-lock-open"></i> Brute-Force Log
+                    </button>
+                    <button class="tab-btn" data-tab="tab-commands">
+                        <i class="fa-solid fa-code"></i> Command Stream
+                    </button>
+                    <button class="tab-btn" data-tab="tab-quarantine">
+                        <i class="fa-solid fa-bug"></i> Quarantined Payloads
+                    </button>
+                </nav>
+                <div class="search-box">
+                    <i class="fa-solid fa-magnifying-glass"></i>
+                    <input type="text" id="table-search" placeholder="Filter by IP, User, Command...">
+                </div>
+            </div>
+
+            <!-- Tab Content Panels -->
+            <section class="tab-contents">
+                <!-- Sessions Tab -->
+                <div class="tab-panel active" id="tab-sessions">
+                    <div class="table-card">
+                        <table class="data-table" id="table-sessions">
+                            <thead>
+                                <tr>
+                                    <th>Status</th>
+                                    <th>Session ID</th>
+                                    <th>Attacker IP</th>
+                                    <th>Source Port</th>
+                                    <th>Failed Attempts</th>
+                                    <th>Auth User</th>
+                                    <th>Start Time (UTC)</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr><td colspan="7" class="loading-cell">Loading session records...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Brute-Force Log Tab -->
+                <div class="tab-panel" id="tab-auth">
+                    <div class="table-card">
+                        <table class="data-table" id="table-auth">
+                            <thead>
+                                <tr>
+                                    <th>Result</th>
+                                    <th>Attempt #</th>
+                                    <th>Attacker IP</th>
+                                    <th>Username</th>
+                                    <th>Password</th>
+                                    <th>Timestamp (UTC)</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr><td colspan="6" class="loading-cell">Loading auth attempts...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Command Stream Tab -->
+                <div class="tab-panel" id="tab-commands">
+                    <div class="table-card">
+                        <table class="data-table" id="table-commands">
+                            <thead>
+                                <tr>
+                                    <th>Attacker IP</th>
+                                    <th>Command</th>
+                                    <th>Arguments</th>
+                                    <th>Status Code</th>
+                                    <th>Timestamp (UTC)</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr><td colspan="5" class="loading-cell">Loading command stream...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Quarantined Files Tab -->
+                <div class="tab-panel" id="tab-quarantine">
+                    <div class="table-card">
+                        <table class="data-table" id="table-quarantine">
+                            <thead>
+                                <tr>
+                                    <th>Original Name</th>
+                                    <th>Attacker IP</th>
+                                    <th>File Size</th>
+                                    <th>SHA-256 Hash</th>
+                                    <th>Upload Timestamp</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr><td colspan="6" class="loading-cell">Loading quarantined files...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Modal for File Inspection -->
+    <div class="modal-overlay" id="file-modal">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3><i class="fa-solid fa-file-code"></i> Payload Inspector: <span id="modal-filename">filename</span></h3>
+                <button class="modal-close" id="modal-close-btn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-meta-grid">
+                    <div><strong>SHA256:</strong> <span class="code-span" id="modal-hash"></span></div>
+                    <div><strong>Size:</strong> <span id="modal-size"></span> bytes</div>
+                    <div><strong>Source IP:</strong> <span id="modal-ip"></span></div>
+                    <div><strong>Uploaded:</strong> <span id="modal-time"></span></div>
+                </div>
+                <div class="modal-view-tabs">
+                    <button class="view-btn active" id="btn-view-text">Text Preview</button>
+                    <button class="view-btn" id="btn-view-hex">Hex Dump</button>
+                </div>
+                <div class="code-preview-container">
+                    <pre><code id="modal-content-code">Loading payload content...</code></pre>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <a href="#" class="btn-download" id="modal-download-link" download>
+                    <i class="fa-solid fa-download"></i> Download Safe Sample
+                </a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Dashboard JS -->
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>

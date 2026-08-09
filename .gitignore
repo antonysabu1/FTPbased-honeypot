@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+data/*.db
+data/*.sqlite
+quarantine/*
+!quarantine/.gitkeep
+data/
+quarantine/
+.env
+.DS_Store
