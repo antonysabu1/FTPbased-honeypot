@@ -69,6 +69,62 @@ class TestHoneypotComponents(unittest.TestCase):
         self.assertEqual(stats["total_commands"], 1)
         self.assertEqual(stats["total_uploads"], 1)
 
+    def test_adapter_contract_logging(self):
+        session_id = "ftp-session-uuid-001"
+        client_ip = "10.0.0.5"
+
+        event_data = {
+            "event_id": "event-uuid-12345",
+            "timestamp": "2026-08-12T08:00:00Z",
+            "protocol": "ftp",
+            "source_ip": client_ip,
+            "session_id": session_id,
+            "action": "RETR /var/www/config.php",
+            "parameters": {"command": "RETR", "path": "/var/www/config.php"},
+            "raw_metadata": {"raw_line": "RETR /var/www/config.php", "client_port": 12345},
+            "session_source": "protocol_native",
+            "response_status": 150,
+            "response_type": "file_download"
+        }
+
+        event_id = self.db.log_event(event_data)
+        self.assertEqual(event_id, "event-uuid-12345")
+
+        events = self.db.get_events(limit=10)
+        self.assertEqual(len(events), 1)
+        ev = events[0]
+        self.assertEqual(ev["protocol"], "ftp")
+        self.assertEqual(ev["source_ip"], client_ip)
+        self.assertEqual(ev["session_id"], session_id)
+        self.assertEqual(ev["action"], "RETR /var/www/config.php")
+        self.assertEqual(ev["session_source"], "protocol_native")
+        self.assertEqual(str(ev["response_status"]), "150")
+        self.assertEqual(ev["response_type"], "file_download")
+
+    def test_decide_response_seam(self):
+        from honeypot.adaptive import decide_response, ResponsePlan
+
+        session_id = "test-seam-session"
+
+        plan = decide_response(session_id, "CONNECT", {})
+        self.assertIsInstance(plan, ResponsePlan)
+        self.assertEqual(plan.response_status, 220)
+        self.assertEqual(plan.response_type, "welcome_banner")
+
+        plan_user = decide_response(session_id, "USER admin", {"username": "admin"})
+        self.assertEqual(plan_user.response_status, 331)
+        self.assertEqual(plan_user.response_type, "auth_prompt")
+
+        plan_pass = decide_response(session_id, "PASS ******", {"password": "wrong"}, context={"failed_attempts": 0, "failed_threshold": 3})
+        self.assertEqual(plan_pass.response_status, 530)
+        self.assertEqual(plan_pass.response_type, "auth_failure")
+        self.assertFalse(plan_pass.extra.get("authenticated"))
+
+        plan_pass_ok = decide_response(session_id, "PASS ******", {"password": "secret"}, context={"failed_attempts": 3, "failed_threshold": 3})
+        self.assertEqual(plan_pass_ok.response_status, 230)
+        self.assertEqual(plan_pass_ok.response_type, "auth_success")
+        self.assertTrue(plan_pass_ok.extra.get("authenticated"))
+
 
 if __name__ == "__main__":
     unittest.main()

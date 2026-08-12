@@ -101,3 +101,204 @@ class AdaptiveDeceptionEngine:
         self.q_table[state][action] = round(new_q, 4)
 
 adaptive_engine = AdaptiveDeceptionEngine()
+
+
+class ResponsePlan:
+    """
+    Response Plan object returned by decide_response seam.
+    Defines the response text, protocol status code, short label response type,
+    tarpit delay, and any extra metadata for execution.
+    """
+    def __init__(self, response_text: str, response_status: int, response_type: str, delay_seconds: float = 0.0, extra: dict = None):
+        self.response_text = response_text
+        self.response_status = int(response_status) if isinstance(response_status, int) or (isinstance(response_status, str) and response_status.isdigit()) else response_status
+        self.response_type = response_type
+        self.delay_seconds = delay_seconds
+        self.extra = extra or {}
+
+    def to_dict(self):
+        return {
+            "response_text": self.response_text,
+            "response_status": self.response_status,
+            "response_type": self.response_type,
+            "delay_seconds": self.delay_seconds,
+            "extra": self.extra
+        }
+
+
+def decide_response(session_id: str, action: str, parameters: dict, context: dict = None) -> ResponsePlan:
+    """
+    Decides what fake content/behavior to return for this interaction.
+    RIGHT NOW: rule-based & adaptive decision logic for FTP adapter.
+    LATER: internals get replaced with a call into the shared Control Engine.
+    """
+    from honeypot.config import FTP_WELCOME_BANNER, FAILED_ATTEMPTS_THRESHOLD
+
+    context = context or {}
+    vfs_instance = context.get("vfs")
+    has_uploaded = context.get("has_uploaded", False)
+
+    # Extract command string
+    raw_action = (action or "").strip()
+    parts = raw_action.split(" ", 1)
+    cmd = parts[0].upper()
+    raw_args = parameters.get("raw_args", parts[1] if len(parts) > 1 else "")
+
+    # Query Adaptive Deception Engine for delay & dynamic injection
+    delay_seconds = 0.0
+    if vfs_instance:
+        adaptive_eval = adaptive_engine.evaluate_response(session_id, cmd, raw_args, vfs_instance, has_uploaded)
+        delay_seconds = adaptive_eval.get("delay_seconds", 0.0)
+
+    # Response decision mapping
+    if cmd == "CONNECT":
+        return ResponsePlan(FTP_WELCOME_BANNER, 220, "welcome_banner", delay_seconds=delay_seconds)
+
+    elif cmd == "USER":
+        username = parameters.get("username", raw_args.strip() or "anonymous")
+        return ResponsePlan(f"331 Password required for {username}.", 331, "auth_prompt", delay_seconds=delay_seconds)
+
+    elif cmd == "PASS":
+        failed_attempts = context.get("failed_attempts", 0) + 1
+        threshold = context.get("failed_threshold", FAILED_ATTEMPTS_THRESHOLD)
+        if failed_attempts <= threshold:
+            return ResponsePlan(
+                "530 Login incorrect.", 530, "auth_failure",
+                delay_seconds=delay_seconds,
+                extra={"authenticated": False, "failed_attempts": failed_attempts}
+            )
+        else:
+            auth_user = parameters.get("username") or context.get("username") or "anonymous"
+            return ResponsePlan(
+                "230 User logged in, proceed.", 230, "auth_success",
+                delay_seconds=delay_seconds,
+                extra={"authenticated": True, "failed_attempts": failed_attempts, "authenticated_user": auth_user}
+            )
+
+    elif cmd == "SYST":
+        return ResponsePlan("215 UNIX Type: L8", 215, "system_info", delay_seconds=delay_seconds)
+
+    elif cmd == "FEAT":
+        feat_str = "211-Features:\r\n PASV\r\n UTF8\r\n REST STREAM\r\n SIZE\r\n MLSD\r\n211 End"
+        return ResponsePlan(feat_str, 211, "features_list", delay_seconds=delay_seconds)
+
+    elif cmd in ["PWD", "XPWD"]:
+        cwd = context.get("cwd", "/var/www")
+        return ResponsePlan(f'257 "{cwd}" is current directory.', 257, "working_directory", delay_seconds=delay_seconds)
+
+    elif cmd == "CWD":
+        if not context.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        cwd = context.get("cwd", "/var/www")
+        target = raw_args.strip()
+        if vfs_instance:
+            target_path = vfs_instance.normalize_path(cwd, target)
+            node = vfs_instance.get_node(target_path)
+            if node and node.is_dir:
+                return ResponsePlan(
+                    f'250 Directory successfully changed to "{target_path}".', 250, "directory_change",
+                    delay_seconds=delay_seconds, extra={"new_cwd": target_path}
+                )
+        return ResponsePlan("550 Failed to change directory.", 550, "directory_error", delay_seconds=delay_seconds)
+
+    elif cmd == "CDUP":
+        if not context.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        cwd = context.get("cwd", "/var/www")
+        if vfs_instance:
+            target_path = vfs_instance.normalize_path(cwd, "..")
+            return ResponsePlan(
+                f'250 Directory successfully changed to "{target_path}".', 250, "directory_change",
+                delay_seconds=delay_seconds, extra={"new_cwd": target_path}
+            )
+        return ResponsePlan("550 Failed to change directory.", 550, "directory_error", delay_seconds=delay_seconds)
+
+    elif cmd == "TYPE":
+        mode = raw_args.strip().upper()
+        if mode in ["A", "I"]:
+            return ResponsePlan(f"200 Switching to {mode} mode.", 200, "transfer_type", delay_seconds=delay_seconds, extra={"transfer_type": mode})
+        return ResponsePlan("504 Command not implemented for that parameter.", 504, "error_response", delay_seconds=delay_seconds)
+
+    elif cmd == "PASV":
+        pasv_str = context.get("pasv_str", "227 Entering Passive Mode.")
+        return ResponsePlan(pasv_str, 227, "passive_mode", delay_seconds=delay_seconds)
+
+    elif cmd == "PORT":
+        if context.get("bounce_detected", False):
+            return ResponsePlan("501 Illegal PORT command (FTP Bounce Attack detected).", 501, "bounce_attack_blocked", delay_seconds=delay_seconds)
+        return ResponsePlan("200 PORT command successful.", 200, "active_mode", delay_seconds=delay_seconds)
+
+    elif cmd in ["LIST", "NLST"]:
+        if not context.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        return ResponsePlan("150 Here comes the directory listing.", 150, "directory_listing", delay_seconds=delay_seconds)
+
+    elif cmd == "RETR":
+        if not context.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        filename = raw_args.strip()
+        cwd = context.get("cwd", "/var/www")
+        if vfs_instance:
+            target_path = vfs_instance.normalize_path(cwd, filename)
+            content = vfs_instance.get_file_content(target_path)
+            if content is not None:
+                return ResponsePlan(
+                    f"150 Opening BINARY mode data connection for {filename} ({len(content)} bytes).", 150, "file_download",
+                    delay_seconds=delay_seconds, extra={"content": content}
+                )
+        return ResponsePlan("550 Failed to open file.", 550, "file_error", delay_seconds=delay_seconds)
+
+    elif cmd == "STOR":
+        if not context.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        return ResponsePlan("150 Ok to send data.", 150, "file_upload", delay_seconds=delay_seconds)
+
+    elif cmd == "SIZE":
+        if not context.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        cwd = context.get("cwd", "/var/www")
+        if vfs_instance:
+            target_path = vfs_instance.normalize_path(cwd, raw_args.strip())
+            node = vfs_instance.get_node(target_path)
+            if node and not node.is_dir:
+                return ResponsePlan(f"213 {node.size}", 213, "file_size", delay_seconds=delay_seconds)
+        return ResponsePlan("550 Could not get file size.", 550, "file_error", delay_seconds=delay_seconds)
+
+    elif cmd == "DELE":
+        if not context.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        cwd = context.get("cwd", "/var/www")
+        if vfs_instance:
+            target_path = vfs_instance.normalize_path(cwd, raw_args.strip())
+            if vfs_instance.remove_node(target_path):
+                return ResponsePlan("250 Delete operation successful.", 250, "file_delete", delay_seconds=delay_seconds)
+        return ResponsePlan("550 File not found.", 550, "file_error", delay_seconds=delay_seconds)
+
+    elif cmd == "MKD":
+        if not context.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        cwd = context.get("cwd", "/var/www")
+        if vfs_instance:
+            target_path = vfs_instance.normalize_path(cwd, raw_args.strip())
+            if vfs_instance.create_dir(target_path):
+                return ResponsePlan(f'257 "{target_path}" directory created.', 257, "directory_create", delay_seconds=delay_seconds)
+        return ResponsePlan("550 Create directory operation failed.", 550, "directory_error", delay_seconds=delay_seconds)
+
+    elif cmd == "RMD":
+        if not context.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        cwd = context.get("cwd", "/var/www")
+        if vfs_instance:
+            target_path = vfs_instance.normalize_path(cwd, raw_args.strip())
+            if vfs_instance.remove_node(target_path):
+                return ResponsePlan("250 Remove directory operation successful.", 250, "directory_remove", delay_seconds=delay_seconds)
+        return ResponsePlan("550 Directory not found.", 550, "directory_error", delay_seconds=delay_seconds)
+
+    elif cmd == "NOOP":
+        return ResponsePlan("200 OK.", 200, "noop_response", delay_seconds=delay_seconds)
+
+    elif cmd == "QUIT":
+        return ResponsePlan("221 Goodbye.", 221, "goodbye", delay_seconds=delay_seconds)
+
+    return ResponsePlan(f"500 Unknown command '{cmd}'.", 500, "unknown_command", delay_seconds=delay_seconds)
+

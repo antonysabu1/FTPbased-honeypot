@@ -2,6 +2,8 @@ import sqlite3
 import datetime
 import threading
 import os
+import uuid
+import json
 from honeypot.config import DB_PATH
 
 class DatabaseManager:
@@ -85,9 +87,76 @@ class DatabaseManager:
                     FOREIGN KEY (session_id) REFERENCES sessions (session_id)
                 )
             """)
-            
+
+            # Unified Events table conforming to the Adapter Contract schema
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    event_id TEXT PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    protocol TEXT NOT NULL,
+                    source_ip TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    parameters TEXT,
+                    raw_metadata TEXT,
+                    session_source TEXT NOT NULL,
+                    response_status TEXT,
+                    response_type TEXT
+                )
+            """)
+
             conn.commit()
             conn.close()
+
+    def log_event(self, event_data):
+        """
+        Logs an interaction using the shared Adapter Contract event schema.
+        Fields:
+        - event_id: str (UUID)
+        - timestamp: str (ISO8601 UTC)
+        - protocol: str ('ftp')
+        - source_ip: str
+        - session_id: str (UUID)
+        - action: str
+        - parameters: dict
+        - raw_metadata: dict
+        - session_source: 'protocol_native'
+        - response_status: int or str
+        - response_type: str
+        """
+        event_id = str(event_data.get("event_id") or uuid.uuid4())
+        timestamp = str(event_data.get("timestamp") or (datetime.datetime.utcnow().isoformat() + "Z"))
+        protocol = str(event_data.get("protocol") or "ftp")
+        source_ip = str(event_data.get("source_ip") or "0.0.0.0")
+        session_id = str(event_data.get("session_id") or "")
+        action = str(event_data.get("action") or "")
+        params = event_data.get("parameters") or {}
+        raw_meta = event_data.get("raw_metadata") or {}
+        session_source = str(event_data.get("session_source") or "protocol_native")
+        response_status = str(event_data.get("response_status") if event_data.get("response_status") is not None else "")
+        response_type = str(event_data.get("response_type") or "")
+
+        parameters_str = json.dumps(params) if isinstance(params, (dict, list)) else str(params)
+        raw_metadata_str = json.dumps(raw_meta) if isinstance(raw_meta, (dict, list)) else str(raw_meta)
+
+        with self._lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO events (
+                    event_id, timestamp, protocol, source_ip, session_id,
+                    action, parameters, raw_metadata, session_source,
+                    response_status, response_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                event_id, timestamp, protocol, source_ip, session_id,
+                action, parameters_str, raw_metadata_str, session_source,
+                response_status, response_type
+            ))
+            conn.commit()
+            conn.close()
+
+        return event_id
 
     def create_session(self, session_id, client_ip, client_port, geo_info=None, abuse_score=0):
         now = datetime.datetime.utcnow().isoformat()
@@ -257,5 +326,21 @@ class DatabaseManager:
             conn.close()
             return rows
 
+    def get_events(self, limit=100):
+        with self._lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM events ORDER BY timestamp DESC LIMIT ?
+            """, (limit,))
+            rows = [dict(r) for r in cursor.fetchall()]
+            conn.close()
+            return rows
+
 # Singleton instance
 db = DatabaseManager()
+
+def log_event(event_data):
+    """Shared Adapter Contract log_event wrapper"""
+    return db.log_event(event_data)
+

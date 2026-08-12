@@ -40,6 +40,14 @@ def get_commands():
     return jsonify(commands)
 
 
+@app.route("/api/events")
+def get_events():
+    limit = request.args.get("limit", 100, type=int)
+    events = db.get_events(limit)
+    return jsonify(events)
+
+
+
 @app.route("/api/quarantine")
 def get_quarantine():
     limit = request.args.get("limit", 50, type=int)

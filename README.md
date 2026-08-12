@@ -37,6 +37,7 @@ docker-compose up --build -d
   - [Option B: Local / Manual Setup](#option-b-local--manual-setup)
   - [Option C: Cloud Deployment (AWS EC2 / DigitalOcean)](#option-c-cloud-deployment-aws-ec2--digitalocean)
   - [Troubleshooting & Common Errors](#troubleshooting--common-errors)
+- [Adapter Contract Compliance (FTP Adapter)](#-adapter-contract-compliance-ftp-adapter)
 - [Configuration Guide](#-configuration-guide)
 - [Attacker Testing & Attack Simulation](#-attacker-testing--attack-simulation)
 - [Performance & Metric Evaluation](#-performance--metric-evaluation)
@@ -225,6 +226,62 @@ python run_honeypot.py
 <b>Cause:</b> Missing data or quarantine directory permissions.<br>
 <b>Fix:</b> Run <code>mkdir -p data quarantine && chmod -R 777 data quarantine</code> before running <code>docker-compose up</code>.
 </details>
+
+---
+
+## 🔌 Adapter Contract Compliance (FTP Adapter)
+
+AegisFTP strictly adheres to the **Shared Adapter Contract** standard for pluggable honeypot services:
+
+1. **Job 1: Convincing & Safe Protocol Implementation**:
+   - Implements FTP RFC 959 control and data transfer protocol handlers built on Twisted asynchronous networking framework.
+   - **Safety First**: Everything is 100% fake. No real system authentication, no host OS shell or command execution, no actual host filesystem access, and no arbitrary outbound network calls.
+2. **Job 2: Shared Log Event Schema (`log_event()`)**:
+   - Every single interaction produces exactly one structured event logged via `log_event()` conforming to the required 11-field schema:
+     ```json
+     {
+       "event_id": "uuid — generated per event",
+       "timestamp": "ISO8601 UTC string (e.g. 2026-08-12T08:00:00Z)",
+       "protocol": "ftp",
+       "source_ip": "attacker client IP address",
+       "session_id": "uuid — protocol-native TCP session identifier",
+       "action": "normalized string (e.g. 'RETR /var/www/config.php' or 'USER admin')",
+       "parameters": { "command": "RETR", "path": "/var/www/config.php" },
+       "raw_metadata": { "raw_line": "RETR /var/www/config.php", "client_port": 54321 },
+       "session_source": "protocol_native",
+       "response_status": 150,
+       "response_type": "file_download"
+     }
+     ```
+3. **Job 2a: Session Tracking**:
+   - Session boundary matches each connected TCP connection with `session_source: "protocol_native"`.
+4. **Job 3: Single Response Decision Seam (`decide_response()`)**:
+   - All response decision logic goes through `decide_response(session_id, action, parameters, context) -> ResponsePlan`.
+   - Isolates fake response logic behind one single choke point ready for future AI Control Engine integration.
+
+### How to Run & Test the FTP Adapter
+
+- **Start Honeypot Adapter**:
+  ```bash
+  python run_honeypot.py
+  ```
+  *Default Listen Address*: `0.0.0.0:21` (or port specified via `FTP_PORT=2121`).
+
+- **Testing with Standard FTP Client**:
+  ```bash
+  ftp localhost 21
+  # Try logging in with 'admin' / 'password' (3 failed attempts allowed before entry)
+  ```
+
+- **Testing with cURL**:
+  ```bash
+  curl -u admin:password ftp://localhost:21/var/www/config.php
+  ```
+
+- **Testing with Nmap**:
+  ```bash
+  nmap -sV -p 21 localhost
+  ```
 
 ---
 
