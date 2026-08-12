@@ -15,6 +15,17 @@ services:
       - FAILED_ATTEMPTS_THRESHOLD=3
       - DASHBOARD_HOST=0.0.0.0
       - DASHBOARD_PORT=5000
+      # Change this in production - protects the credential-exposing dashboard
+      - DASHBOARD_USER=admin
+      - DASHBOARD_PASSWORD=aegisftp-admin-2026
+    # NIST SP 800-190 hardening (matches README claims): non-root, read-only
+    # rootfs, no Linux capabilities except binding low ports (21/5000).
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
     volumes:
       - ./data:/app/data
       - ./quarantine:/app/quarantine

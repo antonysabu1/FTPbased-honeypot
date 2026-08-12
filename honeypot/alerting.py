@@ -4,6 +4,7 @@ Sends instant notifications to Telegram, Discord, or Slack webhooks on security 
 """
 import os
 import json
+import hashlib
 import urllib.request
 import logging
 
@@ -64,13 +65,21 @@ class WebhookAlertNotifier:
 
     def notify_brute_force_threshold(self, client_ip, failed_attempts, username, password):
         title = "Brute-Force Threshold Exceeded (Access Granted Trap)"
+        # V7: never send plaintext passwords over webhook channels - only a
+        # truncated SHA-256 digest. Full plaintext stays local in the SQLite DB.
+        password_hash = hashlib.sha256(password.encode("utf-8", errors="replace")).hexdigest()[:16]
         msg = (
             f"• *Attacker IP*: `{client_ip}`\n"
             f"• *Failed Attempts*: {failed_attempts}\n"
-            f"• *Trapped Credential*: User: `{username}` | Pass: `{password}`\n"
+            f"• *Trapped Credential*: User: `{username}` | Pass SHA-256[16]: `{password_hash}`\n"
             f"• *Status*: Accepted into Virtual Filesystem"
         )
         self.send_alert(title, msg, severity="HIGH")
+
+    def notify_banned_ip(self, client_ip):
+        title = "Source IP Banned (Tripwire Tripped)"
+        msg = f"• *Attacker IP*: `{client_ip}`\n• *Action*: Connection refused, reported to AbuseIPDB"
+        self.send_alert(title, msg, severity="CRITICAL")
 
     def notify_payload_uploaded(self, client_ip, original_name, sha256_hash, size, geo_info, yara_matches):
         title = "Malware Payload Quarantined"

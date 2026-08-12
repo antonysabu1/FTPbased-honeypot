@@ -104,8 +104,8 @@ Traditional honeypots exist on a static spectrum: **low-interaction honeypots** 
 
 ## ✨ Key Features
 
-- 🧠 **Adaptive Q-Learning Deception Engine**: Dynamically calculates command frequency and adversary states to inject tarpit response delays ($2.0s - 4.5s$) against rapid bot scanners and dynamically generate honey-assets (`database_backup.sql`).
-- 🪤 **3-Attempt Brute-Force Credential Trap**: Rejects the first 3 login attempts with `530 Login incorrect` to harvest complete dictionary combinations from automated bots (Hydra, Medusa), then grants access starting on attempt 4 (`230 User logged in`).
+- 🧠 **Adaptive Q-Learning Deception Engine**: Dynamically calculates command frequency and adversary states to inject tarpit response delays against rapid bot scanners and dynamically generate honey-assets (`database_backup.sql`). The Q-table is updated in real time from observed attacker follow-on behavior and session dwell time, so tarpit/injection decisions genuinely adapt.
+- 🪤 **Per-IP Brute-Force Credential Trap**: Rejects the first `T-1` login attempts with `530 Login incorrect` to harvest dictionary combinations from automated bots (Hydra, Medusa), then grants access (`230 User logged in`) on attempt `T`. `T` is a **randomized per-IP threshold (3–7)** that persists across connections — so bots that rotate connections still trip the bait, and the "always grants on attempt 4" fingerprint is removed. IPs that complete too many trap cycles are automatically banned and reported to AbuseIPDB.
 - 🐧 **Realistic Virtual Linux Filesystem**: Emulates a complete in-memory directory tree pre-loaded with realistic target files: `/etc/passwd`, `/etc/shadow`, `/var/www/config.php` (fake MySQL passwords), `/var/log/syslog`, and `/home/admin/backup.sql`.
 - 🏷️ **Native MITRE ATT&CK Auto-Mapper**: Automatically categorizes observed FTP commands into standardized MITRE technique IDs (`T1110.001`, `T1003.008`, `T1505.003`, `T1090.002`, `T1059`, `T1083`).
 - 📦 **Malware Quarantine & YARA Scanner**: Intercepts uploaded files via `STOR`, computes SHA-256 hashes, stores raw bytes in `./quarantine/`, and scans payloads using YARA Web Shell rules.
@@ -297,16 +297,33 @@ PASV_PORT_MIN=50000
 PASV_PORT_MAX=50010
 
 # Security Logic
-FAILED_ATTEMPTS_THRESHOLD=3
+FAILED_ATTEMPTS_THRESHOLD=3       # fallback default when no per-IP threshold
+AUTH_THRESHOLD_MIN=3              # per-IP trap threshold range (randomized)
+AUTH_THRESHOLD_MAX=7
+MAX_IP_FAILED_ATTEMPTS=100        # per-IP ban tripwire (total failed attempts)
+TRIPWIRE_GRANT_CYCLES=50          # per-IP ban tripwire (completed trap cycles)
+JITTER_DELAY_MIN=0.05             # unconditional response jitter (anti-fingerprint)
+JITTER_DELAY_MAX=0.35
+TARPIT_DELAY_MIN=1.5              # probabilistic large tarpit range
+TARPIT_DELAY_MAX=6.0
+TARPIT_PROBABILITY=0.6
 
 # Dashboard & Webhooks
 DASHBOARD_HOST=0.0.0.0
 DASHBOARD_PORT=5000
+DASHBOARD_USER=admin              # required for the dashboard (HTTP Basic Auth)
+DASHBOARD_PASSWORD=aegisftp-admin-2026
 TELEGRAM_BOT_TOKEN=your_telegram_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 ABUSEIPDB_API_KEY=your_abuseipdb_key_here
 ```
+
+> **Security note:** The dashboard exposes harvested credentials and is now
+> protected by HTTP Basic Auth (`DASHBOARD_USER` / `DASHBOARD_PASSWORD`). Change
+> the default password and restrict port 5000 to your admin IP. Passwords are
+> also redacted (SHA-256 digest) from all webhook alerts; full plaintext stays
+> local in the SQLite database, which is created with `0600` permissions.
 
 ---
 

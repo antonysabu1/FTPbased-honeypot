@@ -1,11 +1,31 @@
 import os
 import binascii
-from flask import Flask, render_template, jsonify, request, send_from_directory, abort
-from honeypot.config import DASHBOARD_HOST, DASHBOARD_PORT, SECRET_KEY, QUARANTINE_DIR
+from flask import Flask, render_template, jsonify, request, send_from_directory, abort, Response
+from honeypot.config import (
+    DASHBOARD_HOST, DASHBOARD_PORT, SECRET_KEY, QUARANTINE_DIR,
+    DASHBOARD_USER, DASHBOARD_PASSWORD,
+)
 from honeypot.database import db
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["SECRET_KEY"] = SECRET_KEY
+
+
+# V7: the dashboard exposes harvested credentials, so require HTTP Basic Auth.
+# Credentials come from DASHBOARD_USER / DASHBOARD_PASSWORD (env or defaults).
+def _check_auth(username, password):
+    return username == DASHBOARD_USER and password == DASHBOARD_PASSWORD
+
+
+@app.before_request
+def require_auth():
+    auth = request.authorization
+    if not auth or not _check_auth(auth.username, auth.password):
+        return Response(
+            "Authentication required",
+            401,
+            {"WWW-Authenticate": 'Basic realm="AegisFTP Dashboard"'},
+        )
 
 
 @app.route("/")

@@ -13,3 +13,4 @@ data/
 quarantine/
 .env
 .DS_Store
+auth_trap_test_log.csv

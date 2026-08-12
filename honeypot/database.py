@@ -108,6 +108,12 @@ class DatabaseManager:
             conn.commit()
             conn.close()
 
+        # V7: the DB holds harvested credentials - restrict to owner read/write.
+        try:
+            os.chmod(self.db_path, 0o600)
+        except OSError:
+            pass
+
     def log_event(self, event_data):
         """
         Logs an interaction using the shared Adapter Contract event schema.

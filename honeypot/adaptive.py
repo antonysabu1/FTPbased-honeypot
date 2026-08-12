@@ -6,6 +6,14 @@ import time
 import random
 import logging
 
+from honeypot.config import (
+    JITTER_DELAY_MIN,
+    JITTER_DELAY_MAX,
+    TARPIT_DELAY_MIN,
+    TARPIT_DELAY_MAX,
+    TARPIT_PROBABILITY,
+)
+
 logger = logging.getLogger("AegisFTP.Adaptive")
 
 class AdaptiveDeceptionEngine:
@@ -28,14 +36,18 @@ class AdaptiveDeceptionEngine:
         # Session activity trackers
         self.session_cmd_timestamps = {}
         self.session_states = {}
+        # V4: (state, action) decided for each session, rewarded on the next
+        # observed command so the Q-table genuinely adapts to attacker behavior.
+        self.session_pending = {}
 
-    def get_session_state(self, session_id, last_cmd, last_args, has_uploaded_file=False):
+    def get_session_state(self, session_id, last_cmd, last_args, has_uploaded_file=False, record=True):
         now = time.time()
         if session_id not in self.session_cmd_timestamps:
             self.session_cmd_timestamps[session_id] = []
         
         timestamps = self.session_cmd_timestamps[session_id]
-        timestamps.append(now)
+        if record:
+            timestamps.append(now)
         # Keep window of last 10 seconds
         timestamps = [t for t in timestamps if now - t <= 10.0]
         self.session_cmd_timestamps[session_id] = timestamps
@@ -59,12 +71,53 @@ class AdaptiveDeceptionEngine:
             state_actions = self.q_table.get(state, {})
             return max(state_actions, key=state_actions.get) if state_actions else "NORMAL_RESPONSE"
 
+    def _reward_previous(self, session_id, command, args):
+        """V4: Reward the previous (state, action) using the newly observed
+        follow-on command as the outcome signal, then update the Q-table."""
+        pending = self.session_pending.pop(session_id, None)
+        if not pending:
+            return
+        state, action = pending
+        next_state = self.get_session_state(session_id, command, args, record=False)
+
+        # Engagement rewards: tarpits that still get more credential attempts
+        # and injected assets that get re-fetched are the behaviors we want.
+        if action == "TARPIT_DELAY":
+            reward = 2.0 if command in ("PASS", "USER") else 0.5
+        elif action == "DYNAMIC_INJECTION":
+            reward = 3.0 if command == "RETR" else 1.0
+        elif action == "FAKE_PERM_ERROR":
+            reward = 0.8
+        else:
+            reward = -0.1
+        if state == next_state and action != "NORMAL_RESPONSE":
+            reward += 0.5  # attacker stayed in the same deceptive state
+
+        self.update_q_value(state, action, reward, next_state)
+
+    def reward_dwell(self, session_id, dwell_seconds):
+        """V4: Bonus reward for long session dwell time (attacker stayed engaged)."""
+        pending = self.session_pending.get(session_id)
+        if not pending:
+            return
+        state, action = pending
+        bonus = min(dwell_seconds / 30.0, 5.0)
+        self.update_q_value(state, action, bonus, state)
+
+    def session_ended(self, session_id):
+        """Release per-session bookkeeping (prevents unbounded memory growth)."""
+        self.session_pending.pop(session_id, None)
+        self.session_cmd_timestamps.pop(session_id, None)
+        self.session_states.pop(session_id, None)
+
     def evaluate_response(self, session_id, command, args, vfs_instance, has_uploaded=False):
         """
         Determines response modification (delay, dynamic file creation, or response code modification)
         """
+        self._reward_previous(session_id, command, args)
         state = self.get_session_state(session_id, command, args, has_uploaded)
         action = self.select_action(state)
+        self.session_pending[session_id] = (state, action)
 
         result = {
             "state": state,
@@ -73,9 +126,13 @@ class AdaptiveDeceptionEngine:
             "injected_file": None
         }
 
-        if action == "TARPIT_DELAY":
-            # Tarpit response delay (2.0 to 5.0 seconds) to slow down automated brute-force bots
-            result["delay_seconds"] = round(random.uniform(2.0, 4.5), 2)
+        # V5: unconditional jittered latency on every reply so response time is
+        # never a pure function of command rate (removes the timing fingerprint).
+        result["delay_seconds"] = round(random.uniform(JITTER_DELAY_MIN, JITTER_DELAY_MAX), 2)
+
+        if action == "TARPIT_DELAY" and random.random() < TARPIT_PROBABILITY:
+            # Large tarpit delay is now probabilistic, not deterministic (V5)
+            result["delay_seconds"] += round(random.uniform(TARPIT_DELAY_MIN, TARPIT_DELAY_MAX), 2)
             logger.info(f"[Adaptive Engine] Tarpitting session {session_id[:8]} for {result['delay_seconds']}s")
 
         elif action == "DYNAMIC_INJECTION":
@@ -89,7 +146,11 @@ class AdaptiveDeceptionEngine:
                 )
                 vfs_instance.add_file(injected_path, backup_sql_content.encode('utf-8'), owner="www-data")
                 result["injected_file"] = injected_path
+                result["delay_seconds"] += round(random.uniform(0.2, 1.0), 2)
                 logger.info(f"[Adaptive Engine] Injected honeypot asset {injected_path} into VFS for session {session_id[:8]}")
+
+        elif action == "FAKE_PERM_ERROR":
+            result["delay_seconds"] += round(random.uniform(0.1, 0.6), 2)
 
         return result
 
@@ -240,6 +301,10 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         cwd = context.get("cwd", "/var/www")
         if vfs_instance:
             target_path = vfs_instance.normalize_path(cwd, filename)
+            # V3: gate the single most sensitive asset behind prior recon activity,
+            # so a freshly-granted session cannot immediately exfiltrate /etc/shadow.
+            if target_path == "/etc/shadow" and not context.get("recon_done", False):
+                return ResponsePlan("550 Permission denied.", 550, "file_error", delay_seconds=delay_seconds)
             content = vfs_instance.get_file_content(target_path)
             if content is not None:
                 return ResponsePlan(
@@ -270,6 +335,10 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         cwd = context.get("cwd", "/var/www")
         if vfs_instance:
             target_path = vfs_instance.normalize_path(cwd, raw_args.strip())
+            # V3: the VFS is shared across sessions, so destructive ops on the
+            # system-critical trees are refused to protect other sessions' intel.
+            if vfs_instance.is_protected_path(target_path):
+                return ResponsePlan("550 Operation not permitted.", 550, "file_error", delay_seconds=delay_seconds)
             if vfs_instance.remove_node(target_path):
                 return ResponsePlan("250 Delete operation successful.", 250, "file_delete", delay_seconds=delay_seconds)
         return ResponsePlan("550 File not found.", 550, "file_error", delay_seconds=delay_seconds)
@@ -290,6 +359,8 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         cwd = context.get("cwd", "/var/www")
         if vfs_instance:
             target_path = vfs_instance.normalize_path(cwd, raw_args.strip())
+            if vfs_instance.is_protected_path(target_path):
+                return ResponsePlan("550 Operation not permitted.", 550, "directory_error", delay_seconds=delay_seconds)
             if vfs_instance.remove_node(target_path):
                 return ResponsePlan("250 Remove directory operation successful.", 250, "directory_remove", delay_seconds=delay_seconds)
         return ResponsePlan("550 Directory not found.", 550, "directory_error", delay_seconds=delay_seconds)

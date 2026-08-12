@@ -222,3 +222,17 @@ class VirtualFileSystem:
             parent_node.children[filename] = VirtualNode(filename, is_dir=True, permissions="rwxr-xr-x")
             return True
         return False
+
+    def is_protected_path(self, path):
+        """V3: True for system paths that must not be destroyed via DELE/RMD.
+
+        The VFS is SHARED across all attacker sessions, so a destructive command
+        (DELE /etc/passwd) would degrade intelligence for every other session.
+        Protect the OS-critical top-level trees while leaving decoy dirs
+        (/var/www, /home/admin, /tmp) writable for realism.
+        """
+        normalized = posixpath.normpath(path or "/")
+        if normalized in ("/", ""):
+            return True
+        top = normalized.strip("/").split("/", 1)[0]
+        return top in ("etc", "bin", "usr", "sbin", "lib", "boot", "root", "dev", "proc", "sys")

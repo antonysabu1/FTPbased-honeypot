@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 import hashlib
 import datetime
@@ -67,6 +68,8 @@ class FTPControlProtocol(LineReceiver):
         self.authenticated_user = None
         self.username = None
         self.failed_attempts = 0
+        self.recon_done = False
+        self.connect_time = None
         self.cwd = "/var/www"
         self.transfer_type = "I"
         self.has_uploaded = False
@@ -80,7 +83,33 @@ class FTPControlProtocol(LineReceiver):
         peer = self.transport.getPeer()
         self.client_ip = peer.host
         self.client_port = peer.port
-        
+        self.connect_time = time.time()
+
+        # V6: refuse tripwire-banned source IPs before anything else
+        if threat_intel.is_banned(self.client_ip):
+            self.sendLine(b"421 Service not available, closing control connection.")
+            log_event({
+                "event_id": str(uuid.uuid4()),
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                "protocol": "ftp",
+                "source_ip": self.client_ip,
+                "session_id": self.session_id,
+                "action": "CONNECT_BANNED",
+                "parameters": {},
+                "raw_metadata": {"client_port": self.client_port, "reason": "tripwire_ban"},
+                "session_source": "protocol_native",
+                "response_status": 421,
+                "response_type": "banned_connection"
+            })
+            alert_notifier.notify_banned_ip(self.client_ip)
+            self.transport.loseConnection()
+            return
+
+        # V1/V2: seed this session from the per-IP trap state so connection-
+        # rotating bots accumulate toward the grant, with a per-IP random threshold.
+        self.failed_attempts = threat_intel.get_failed_attempts(self.client_ip)
+        self.grant_threshold = threat_intel.get_threshold(self.client_ip)
+
         # Enhanced Detection: GeoIP & AbuseIPDB Lookup
         self.geo_info = threat_intel.lookup_geoip(self.client_ip)
         abuse_data = threat_intel.check_abuseipdb(self.client_ip)
@@ -117,6 +146,10 @@ class FTPControlProtocol(LineReceiver):
 
     def connectionLost(self, reason):
         self.close_pasv_listener()
+        # V4: reward longer dwell times so the Q-table learns to keep attackers engaged
+        if self.connect_time:
+            adaptive_engine.reward_dwell(self.session_id, time.time() - self.connect_time)
+        adaptive_engine.session_ended(self.session_id)
         db.close_session(self.session_id)
 
     def lineReceived(self, line):
@@ -166,10 +199,15 @@ class FTPControlProtocol(LineReceiver):
             "authenticated": self.authenticated,
             "authenticated_user": self.authenticated_user,
             "username": self.username,
-            "failed_attempts": self.failed_attempts,
-            "failed_threshold": FAILED_ATTEMPTS_THRESHOLD,
+            # V1: the trap decision reads the LIVE per-IP failed-attempt count so
+            # all concurrent sessions from one IP share the accumulation toward
+            # the grant. This is the count BEFORE this attempt; decide_response
+            # applies the +1 for the current PASS.
+            "failed_attempts": threat_intel.get_failed_attempts(self.client_ip),
+            "failed_threshold": getattr(self, "grant_threshold", FAILED_ATTEMPTS_THRESHOLD),
             "cwd": self.cwd,
             "has_uploaded": self.has_uploaded,
+            "recon_done": self.recon_done,
             "active_host": self.active_host,
             "active_port": self.active_port,
             "client_ip": self.client_ip,
@@ -179,6 +217,11 @@ class FTPControlProtocol(LineReceiver):
 
         # Decide response via single choke point seam (Job 3)
         plan = decide_response(self.session_id, action, parameters, context)
+
+        # V1: register FAILED attempts at decision time (before any tarpit delay)
+        # so concurrent sessions from one IP share the accumulation accurately.
+        if command == "PASS" and not self.authenticated and not plan.extra.get("authenticated", False):
+            threat_intel.register_attempt(self.client_ip)
 
         # Log event using exact shared contract schema (Job 2 & 2a)
         log_event({
@@ -260,6 +303,7 @@ class FTPControlProtocol(LineReceiver):
 
         elif command == "PASS":
             password = args.strip()
+            was_authenticated = self.authenticated
             self.failed_attempts = plan.extra.get("failed_attempts", self.failed_attempts + 1)
             is_auth = plan.extra.get("authenticated", False)
             if is_auth:
@@ -270,6 +314,9 @@ class FTPControlProtocol(LineReceiver):
                 alert_notifier.notify_brute_force_threshold(
                     self.client_ip, self.failed_attempts, self.username or "unknown", password
                 )
+                if not was_authenticated:
+                    # V6: count a completed trap cycle for this IP (may trip the ban)
+                    threat_intel.register_grant(self.client_ip)
             else:
                 db.log_auth_attempt(self.session_id, self.client_ip, self.username or "unknown", password, False, self.failed_attempts)
                 db.update_session_auth(self.session_id, self.failed_attempts)
@@ -313,6 +360,7 @@ class FTPControlProtocol(LineReceiver):
                 self.sendLine(b"550 Directory not found.")
                 return
 
+            self.recon_done = True  # V3: listing is reconnaissance, unlocks gated assets
             listing_bytes = ("\r\n".join(items) + "\r\n").encode('utf-8')
             self.sendLine(plan.response_text.encode('utf-8'))
             data_d = self._get_data_connection(mode='SEND', data=listing_bytes)
@@ -332,6 +380,7 @@ class FTPControlProtocol(LineReceiver):
                 self.sendLine(plan.response_text.encode('utf-8'))
                 return
 
+            self.recon_done = True  # V3: a successful retrieval is also recon
             content = plan.extra.get("content", b"")
             self.sendLine(plan.response_text.encode('utf-8'))
             data_d = self._get_data_connection(mode='SEND', data=content)

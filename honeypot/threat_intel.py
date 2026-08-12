@@ -4,9 +4,19 @@ Integrates GeoIP location lookup, YARA payload signature scanning, AbuseIPDB thr
 """
 import os
 import json
+import random
+import threading
+import urllib.parse
 import urllib.request
 import hashlib
 import logging
+
+from honeypot.config import (
+    AUTH_THRESHOLD_MIN,
+    AUTH_THRESHOLD_MAX,
+    MAX_IP_FAILED_ATTEMPTS,
+    TRIPWIRE_GRANT_CYCLES,
+)
 
 logger = logging.getLogger("AegisFTP.ThreatIntel")
 
@@ -16,9 +26,83 @@ class ThreatIntelEngine:
         self.abuseipdb_key = abuseipdb_key or os.environ.get("ABUSEIPDB_API_KEY", "")
         self.geoip_cache = {}
 
+        # Per-IP credential trap state (V1/V6).
+        # The trap counter is deliberately PER-IP, not per-session, so bots that
+        # open a fresh connection per credential still accumulate toward the grant.
+        self._ip_lock = threading.Lock()
+        self._ip_failed = {}      # total failed PASS attempts per source IP
+        self._ip_cycles = {}      # completed trap cycles (grants) per source IP
+        self._ip_threshold = {}   # randomized grant threshold per source IP (V2)
+        self._banned_ips = set()  # tripwire-banned IPs (V6)
+
+    def get_threshold(self, ip_address):
+        """Randomized per-IP grant threshold, generated once per IP (V2)."""
+        with self._ip_lock:
+            if ip_address not in self._ip_threshold:
+                self._ip_threshold[ip_address] = random.randint(
+                    AUTH_THRESHOLD_MIN, AUTH_THRESHOLD_MAX
+                )
+            return self._ip_threshold[ip_address]
+
+    def get_failed_attempts(self, ip_address):
+        """Accumulated failed attempts for an IP (persists across connections)."""
+        with self._ip_lock:
+            return self._ip_failed.get(ip_address, 0)
+
+    def register_attempt(self, ip_address):
+        """Record a failed PASS attempt for an IP. Returns True if now banned."""
+        banned = False
+        with self._ip_lock:
+            self._ip_failed[ip_address] = self._ip_failed.get(ip_address, 0) + 1
+            if self._ip_failed[ip_address] >= MAX_IP_FAILED_ATTEMPTS:
+                self._banned_ips.add(ip_address)
+                banned = True
+        if banned:
+            self.report_abuse(ip_address)
+        return banned
+
+    def register_grant(self, ip_address):
+        """Record a completed trap cycle for an IP. Returns True if now banned."""
+        banned = False
+        with self._ip_lock:
+            self._ip_cycles[ip_address] = self._ip_cycles.get(ip_address, 0) + 1
+            if self._ip_cycles[ip_address] >= TRIPWIRE_GRANT_CYCLES:
+                self._banned_ips.add(ip_address)
+                banned = True
+        if banned:
+            self.report_abuse(ip_address)
+        return banned
+
+    def is_banned(self, ip_address):
+        """True if the IP tripped the tripwire and is refused connections."""
+        with self._ip_lock:
+            return ip_address in self._banned_ips
+
+    def report_abuse(self, ip_address):
+        """Best-effort AbuseIPDB report for a banned IP (only when a key is set)."""
+        if not self.abuseipdb_key:
+            return
+        try:
+            data = urllib.parse.urlencode({
+                "ip": ip_address,
+                "comment": "Repeated FTP honeypot credential-trap completion (credential-stuffing bot)",
+                "categories": "18",
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.abuseipdb.com/api/v2/report",
+                data=data,
+                headers={"Key": self.abuseipdb_key, "Accept": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=4.0)
+            logger.warning(f"Reported banned IP {ip_address} to AbuseIPDB")
+        except Exception as e:
+            logger.warning(f"AbuseIPDB report failed for {ip_address}: {e}")
+
     def lookup_geoip(self, ip_address):
         """Fetches country, city, and ASN for attacker IP (with caching)"""
-        if ip_address in ["127.0.0.1", "localhost", "0.0.0.0"] or ip_address.startswith("192.168.") or ip_address.startswith("10."):
+        if (ip_address.startswith("127.") or ip_address.startswith("10.")
+                or ip_address.startswith("192.168.")
+                or ip_address in ["0.0.0.0", "localhost"]):
             return {"country": "Private Network", "country_code": "LOCAL", "city": "Internal", "isp": "Local LAN"}
 
         if ip_address in self.geoip_cache:
