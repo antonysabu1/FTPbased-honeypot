@@ -13,7 +13,7 @@ class DatabaseManager:
         self.init_db()
 
     def get_connection(self):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=15.0)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -325,6 +325,15 @@ class DatabaseManager:
             rows = [dict(r) for r in cursor.fetchall()]
             conn.close()
             return rows
+
+    def get_quarantined_file(self, file_id):
+        with self._lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM quarantined_files WHERE id = ?", (file_id,))
+            row = cursor.fetchone()
+            conn.close()
+            return dict(row) if row else None
 
     def get_events(self, limit=100):
         with self._lock:

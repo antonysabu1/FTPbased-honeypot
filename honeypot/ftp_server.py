@@ -1,11 +1,14 @@
 import os
+import re
 import uuid
 import hashlib
 import datetime
 import posixpath
-from twisted.internet import reactor, protocol, defer
+import logging
+
+from twisted.internet import reactor, protocol, defer, threads
 from twisted.protocols.basic import LineReceiver
-from twisted.internet.endpoints import TCP4ServerEndpoint, TCP4ClientEndpoint, connectProtocol
+from twisted.internet.endpoints import TCP4ClientEndpoint, connectProtocol
 
 from honeypot.config import (
     FTP_HOST, FTP_PORT, PASV_PORT_MIN, PASV_PORT_MAX,
@@ -18,41 +21,58 @@ from honeypot.mitre_mapper import mitre_mapper
 from honeypot.threat_intel import threat_intel
 from honeypot.alerting import alert_notifier
 
+logger = logging.getLogger("AegisFTP.Server")
+
 # Shared Virtual Filesystem instance across sessions
 vfs = VirtualFileSystem()
 
 
 class FTPDataProtocol(protocol.Protocol):
-    def __init__(self, mode='SEND', data=b'', deferred_result=None):
-        self.mode = mode  # 'SEND' or 'RECV'
-        self.data = data
+    def __init__(self, factory):
+        self.factory = factory
         self.received_bytes = bytearray()
-        self.deferred_result = deferred_result
 
     def connectionMade(self):
-        if self.mode == 'SEND':
-            self.transport.write(self.data)
-            self.transport.loseConnection()
+        self.factory.protocol_connected(self)
 
     def dataReceived(self, chunk):
-        if self.mode == 'RECV':
+        if self.factory.mode == 'RECV':
             self.received_bytes.extend(chunk)
 
     def connectionLost(self, reason):
-        if self.mode == 'RECV' and self.deferred_result and not self.deferred_result.called:
-            self.deferred_result.callback(bytes(self.received_bytes))
+        if self.factory.mode == 'RECV' and self.factory.deferred_result and not self.factory.deferred_result.called:
+            self.factory.deferred_result.callback(bytes(self.received_bytes))
 
 
 class FTPDataServerFactory(protocol.ServerFactory):
-    def __init__(self, mode='SEND', data=b'', deferred_result=None):
-        self.mode = mode
-        self.data = data
-        self.deferred_result = deferred_result
+    def __init__(self):
+        self.mode = None  # 'SEND' or 'RECV'
+        self.data = b''
+        self.deferred_result = None
         self.proto_instance = None
 
     def buildProtocol(self, addr):
-        self.proto_instance = FTPDataProtocol(self.mode, self.data, self.deferred_result)
-        return self.proto_instance
+        proto = FTPDataProtocol(self)
+        return proto
+
+    def protocol_connected(self, proto):
+        self.proto_instance = proto
+        self._check_and_execute()
+
+    def start_transfer(self, mode, data=b'', deferred_result=None):
+        self.mode = mode
+        self.data = data
+        self.deferred_result = deferred_result
+        self._check_and_execute()
+
+    def _check_and_execute(self):
+        if not self.proto_instance or not self.mode:
+            return
+        if self.mode == 'SEND':
+            self.proto_instance.transport.write(self.data)
+            self.proto_instance.transport.loseConnection()
+            if self.deferred_result and not self.deferred_result.called:
+                self.deferred_result.callback(True)
 
 
 class FTPControlProtocol(LineReceiver):
@@ -80,24 +100,18 @@ class FTPControlProtocol(LineReceiver):
         peer = self.transport.getPeer()
         self.client_ip = peer.host
         self.client_port = peer.port
-        
-        # Enhanced Detection: GeoIP & AbuseIPDB Lookup
-        self.geo_info = threat_intel.lookup_geoip(self.client_ip)
-        abuse_data = threat_intel.check_abuseipdb(self.client_ip)
+        self.geo_info = {"country": "Unknown", "country_code": "XX", "city": "Unknown", "isp": "Unknown"}
 
-        # Log session in database
+        # Log session in database immediately
         db.create_session(
             self.session_id, self.client_ip, self.client_port,
-            geo_info=self.geo_info, abuse_score=abuse_data.get("abuse_score", 0)
+            geo_info=self.geo_info, abuse_score=0
         )
-        
-        # Real-time Alerting
-        alert_notifier.notify_new_connection(self.client_ip, self.geo_info)
 
-        # Single choke point response decision via decide_response (Job 3)
+        # Single choke point response decision via decide_response
         plan = decide_response(self.session_id, "CONNECT", {}, context={"vfs": vfs})
 
-        # Log event using exact shared contract schema (Job 2 & 2a)
+        # Log event using exact shared contract schema
         log_event({
             "event_id": str(uuid.uuid4()),
             "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
@@ -115,8 +129,44 @@ class FTPControlProtocol(LineReceiver):
         # Send Welcome Banner
         self.sendLine(plan.response_text.encode('utf-8'))
 
+        # Background thread: GeoIP, AbuseIPDB, and Alerting without blocking Twisted reactor
+        def bg_threat_lookups(ip):
+            geo = threat_intel.lookup_geoip(ip)
+            abuse = threat_intel.check_abuseipdb(ip)
+            return geo, abuse
+
+        def on_threat_lookups_done(result):
+            geo, abuse = result
+            self.geo_info = geo
+            abuse_score = abuse.get("abuse_score", 0)
+            try:
+                conn = db.get_connection()
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE sessions 
+                    SET country = ?, country_code = ?, city = ?, isp = ?, abuse_score = ?
+                    WHERE session_id = ?
+                """, (
+                    geo.get("country", "Unknown"), geo.get("country_code", "XX"),
+                    geo.get("city", "Unknown"), geo.get("isp", "Unknown"),
+                    abuse_score, self.session_id
+                ))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                logger.debug(f"Session geo update failed: {e}")
+            threads.deferToThread(alert_notifier.notify_new_connection, self.client_ip, self.geo_info)
+
+        threads.deferToThread(bg_threat_lookups, self.client_ip).addCallback(on_threat_lookups_done)
+
     def connectionLost(self, reason):
         self.close_pasv_listener()
+        try:
+            summary_tags = mitre_mapper.get_session_mitre_summary(db, self.session_id)
+            tags_str = ",".join([t["technique_id"] for t in summary_tags])
+            db.update_session_mitre_tags(self.session_id, tags_str)
+        except Exception as e:
+            logger.debug(f"Failed to update session mitre tags on disconnect: {e}")
         db.close_session(self.session_id)
 
     def lineReceived(self, line):
@@ -216,37 +266,38 @@ class FTPControlProtocol(LineReceiver):
     def _prepare_pasv_response(self):
         self.close_pasv_listener()
 
-        def try_listen(port_candidate):
+        bound_port = None
+        listener = None
+        factory = FTPDataServerFactory()
+
+        import socket
+        # Try ports in candidate range
+        for p in range(PASV_PORT_MIN, PASV_PORT_MAX + 1):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                endpoint = TCP4ServerEndpoint(reactor, port_candidate, interface=FTP_HOST)
-                factory = FTPDataServerFactory()
-                listener = endpoint.listen(factory)
-                return listener, factory, port_candidate
+                s.bind((FTP_HOST, p))
+                s.close()
+            except Exception:
+                s.close()
+                continue
+            try:
+                listener = reactor.listenTCP(p, factory, interface=FTP_HOST)
+                bound_port = p
+                break
+            except Exception:
+                continue
+
+        # If range exhausted, allow OS to assign an ephemeral port
+        if not listener:
+            try:
+                listener = reactor.listenTCP(0, factory, interface=FTP_HOST)
+                bound_port = listener.getHost().port
             except Exception:
                 return None
 
-        listener_info = None
-        for p in range(PASV_PORT_MIN, PASV_PORT_MAX + 1):
-            res = try_listen(p)
-            if res:
-                listener_info = res
-                break
-
-        if not listener_info:
-            res = try_listen(0)
-            if res:
-                listener_info = res
-
-        if not listener_info:
-            return None
-
-        self.pasv_listener = listener_info[0]
-        self.pasv_factory = listener_info[1]
-        
-        if hasattr(self.pasv_listener, 'getHost'):
-            self.pasv_port = self.pasv_listener.getHost().port
-        else:
-            self.pasv_port = PASV_PORT_MIN
+        self.pasv_listener = listener
+        self.pasv_factory = factory
+        self.pasv_port = bound_port
 
         ip_parts = (FTP_HOST if FTP_HOST != "0.0.0.0" else "127.0.0.1").split(".")
         p1 = self.pasv_port // 256
@@ -255,7 +306,8 @@ class FTPControlProtocol(LineReceiver):
 
     def _dispatch_plan(self, command, args, plan):
         if command == "USER":
-            self.username = args.strip() or "anonymous"
+            raw_user = (args or "").strip()
+            self.username = raw_user if raw_user else "anonymous"
             self.sendLine(plan.response_text.encode('utf-8'))
 
         elif command == "PASS":
@@ -267,7 +319,8 @@ class FTPControlProtocol(LineReceiver):
                 self.authenticated_user = plan.extra.get("authenticated_user", self.username or "anonymous")
                 db.log_auth_attempt(self.session_id, self.client_ip, self.username or "unknown", password, True, self.failed_attempts)
                 db.update_session_auth(self.session_id, self.failed_attempts, self.authenticated_user)
-                alert_notifier.notify_brute_force_threshold(
+                threads.deferToThread(
+                    alert_notifier.notify_brute_force_threshold,
                     self.client_ip, self.failed_attempts, self.username or "unknown", password
                 )
             else:
@@ -288,9 +341,13 @@ class FTPControlProtocol(LineReceiver):
 
         elif command == "PORT":
             if plan.response_status == 200:
-                parts = args.strip().split(",")
-                self.active_host = ".".join(parts[:4])
-                self.active_port = int(parts[4]) * 256 + int(parts[5])
+                try:
+                    parts = [int(p.strip()) for p in args.strip().split(",")]
+                    if len(parts) == 6:
+                        self.active_host = ".".join(str(p) for p in parts[:4])
+                        self.active_port = parts[4] * 256 + parts[5]
+                except Exception:
+                    pass
             self.sendLine(plan.response_text.encode('utf-8'))
 
         elif command in ["LIST", "NLST"]:
@@ -310,7 +367,7 @@ class FTPControlProtocol(LineReceiver):
                 items = vfs.nlist_dir(target_path)
 
             if items is None:
-                self.sendLine(b"550 Directory not found.")
+                self.sendLine(b"550 Directory or file not found.")
                 return
 
             listing_bytes = ("\r\n".join(items) + "\r\n").encode('utf-8')
@@ -352,6 +409,10 @@ class FTPControlProtocol(LineReceiver):
                 return
 
             filename = args.strip()
+            if not filename:
+                self.sendLine(b"501 Syntax error, filename required.")
+                return
+
             vfs_path = vfs.normalize_path(self.cwd, filename)
 
             self.sendLine(plan.response_text.encode('utf-8'))
@@ -363,12 +424,16 @@ class FTPControlProtocol(LineReceiver):
 
                 sha256_hash = hashlib.sha256(received_bytes).hexdigest()
                 timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                safe_basename = os.path.basename(vfs_path).replace("/", "_").replace("\\", "_")
+                safe_raw = os.path.basename(vfs_path.replace("\\", "/"))
+                safe_basename = re.sub(r'[^a-zA-Z0-9._-]', '_', safe_raw) or "payload.bin"
                 quarantine_filename = f"{timestamp}_{sha256_hash[:8]}_{safe_basename}"
                 quarantine_path = os.path.join(QUARANTINE_DIR, quarantine_filename)
 
-                with open(quarantine_path, "wb") as f:
-                    f.write(received_bytes)
+                try:
+                    with open(quarantine_path, "wb") as f:
+                        f.write(received_bytes)
+                except Exception as e:
+                    logger.error(f"Failed to write quarantined file {quarantine_path}: {e}")
 
                 yara_matches = threat_intel.scan_yara_rules(quarantine_path)
                 yara_str = ",".join(yara_matches)
@@ -386,7 +451,8 @@ class FTPControlProtocol(LineReceiver):
                 vfs.add_file(vfs_path, received_bytes, owner=self.authenticated_user or "www-data")
                 self.has_uploaded = True
 
-                alert_notifier.notify_payload_uploaded(
+                threads.deferToThread(
+                    alert_notifier.notify_payload_uploaded,
                     self.client_ip, safe_basename, sha256_hash, len(received_bytes), self.geo_info, yara_matches
                 )
 
@@ -423,14 +489,20 @@ class FTPControlProtocol(LineReceiver):
     def _get_data_connection(self, mode='SEND', data=b''):
         d = defer.Deferred()
         if self.pasv_listener and self.pasv_factory:
-            self.pasv_factory.mode = mode
-            self.pasv_factory.data = data
-            self.pasv_factory.deferred_result = d
+            self.pasv_factory.start_transfer(mode, data, d)
             return d
         elif self.active_host and self.active_port:
-            proto = FTPDataProtocol(mode, data, d)
+            factory = FTPDataServerFactory()
             endpoint = TCP4ClientEndpoint(reactor, self.active_host, self.active_port)
-            connectProtocol(endpoint, proto)
+            def on_connected(proto):
+                factory.protocol_connected(proto)
+                factory.start_transfer(mode, data, d)
+            def on_connect_fail(err):
+                if not d.called:
+                    d.errback(err)
+            connectProtocol(endpoint, factory.buildProtocol(None)).addCallbacks(on_connected, on_connect_fail)
+            self.active_host = None
+            self.active_port = None
             return d
         else:
             d.errback(Exception("No data connection established"))

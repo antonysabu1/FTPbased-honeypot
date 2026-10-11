@@ -13,3 +13,5 @@ data/
 quarantine/
 .env
 .DS_Store
+venv/
+.venv/

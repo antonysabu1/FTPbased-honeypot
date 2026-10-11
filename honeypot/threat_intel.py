@@ -6,6 +6,7 @@ import os
 import json
 import urllib.request
 import hashlib
+import ipaddress
 import logging
 
 logger = logging.getLogger("AegisFTP.ThreatIntel")
@@ -16,13 +17,24 @@ class ThreatIntelEngine:
         self.abuseipdb_key = abuseipdb_key or os.environ.get("ABUSEIPDB_API_KEY", "")
         self.geoip_cache = {}
 
+    def _is_private_ip(self, ip_address):
+        if not ip_address or ip_address in ["localhost", "0.0.0.0"]:
+            return True
+        try:
+            ip_obj = ipaddress.ip_address(ip_address)
+            return ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved or ip_obj.is_link_local
+        except ValueError:
+            return False
+
     def lookup_geoip(self, ip_address):
         """Fetches country, city, and ASN for attacker IP (with caching)"""
-        if ip_address in ["127.0.0.1", "localhost", "0.0.0.0"] or ip_address.startswith("192.168.") or ip_address.startswith("10."):
-            return {"country": "Private Network", "country_code": "LOCAL", "city": "Internal", "isp": "Local LAN"}
-
         if ip_address in self.geoip_cache:
             return self.geoip_cache[ip_address]
+
+        if self._is_private_ip(ip_address):
+            local_res = {"country": "Private Network", "country_code": "LOCAL", "city": "Internal", "isp": "Local LAN"}
+            self.geoip_cache[ip_address] = local_res
+            return local_res
 
         try:
             url = f"http://ip-api.com/json/{ip_address}?fields=status,country,countryCode,city,isp,query"
@@ -41,7 +53,9 @@ class ThreatIntelEngine:
         except Exception as e:
             logger.warning(f"GeoIP API lookup error for {ip_address}: {e}")
 
-        return {"country": "Unknown", "country_code": "XX", "city": "Unknown", "isp": "Unknown"}
+        fallback = {"country": "Unknown", "country_code": "XX", "city": "Unknown", "isp": "Unknown"}
+        self.geoip_cache[ip_address] = fallback
+        return fallback
 
     def check_abuseipdb(self, ip_address):
         """Checks IP reputation score on AbuseIPDB REST API"""

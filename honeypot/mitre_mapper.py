@@ -50,8 +50,8 @@ class MitreAttackMapper:
         cmd = (command or "").upper()
         arguments = (args or "").lower()
 
-        # 1. Brute Force
-        if cmd == "PASS" or failed_attempts > 0:
+        # 1. Brute Force: Apply to authentication attempts
+        if cmd == "PASS" or (cmd == "USER" and failed_attempts > 0):
             tags.append(MITRE_ATTACK_MAPPINGS["BRUTE_FORCE"])
 
         # 2. Credential Dumping

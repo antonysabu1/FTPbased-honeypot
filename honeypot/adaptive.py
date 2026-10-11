@@ -62,19 +62,33 @@ class AdaptiveDeceptionEngine:
     def evaluate_response(self, session_id, command, args, vfs_instance, has_uploaded=False):
         """
         Determines response modification (delay, dynamic file creation, or response code modification)
+        and runs dynamic Q-learning updates.
         """
+        prev_state = self.session_states.get(session_id, "LOW_ACTIVITY")
         state = self.get_session_state(session_id, command, args, has_uploaded)
+        self.session_states[session_id] = state
         action = self.select_action(state)
+
+        # Update Q-values dynamically based on deception outcome
+        reward = 1.0
+        if state == "PAYLOAD_UPLOADED":
+            reward = 10.0
+        elif state == "SENSITIVE_FILE_PROBING":
+            reward = 5.0
+        elif state == "HIGH_FREQUENCY_SCAN" and action == "TARPIT_DELAY":
+            reward = 8.0
+        self.update_q_value(prev_state, action, reward, state)
 
         result = {
             "state": state,
             "action": action,
             "delay_seconds": 0.0,
-            "injected_file": None
+            "injected_file": None,
+            "fake_perm_error": False
         }
 
         if action == "TARPIT_DELAY":
-            # Tarpit response delay (2.0 to 5.0 seconds) to slow down automated brute-force bots
+            # Tarpit response delay (2.0 to 4.5 seconds) to slow down automated brute-force bots
             result["delay_seconds"] = round(random.uniform(2.0, 4.5), 2)
             logger.info(f"[Adaptive Engine] Tarpitting session {session_id[:8]} for {result['delay_seconds']}s")
 
@@ -90,6 +104,11 @@ class AdaptiveDeceptionEngine:
                 vfs_instance.add_file(injected_path, backup_sql_content.encode('utf-8'), owner="www-data")
                 result["injected_file"] = injected_path
                 logger.info(f"[Adaptive Engine] Injected honeypot asset {injected_path} into VFS for session {session_id[:8]}")
+
+        elif action == "FAKE_PERM_ERROR":
+            if command in ["RETR", "CWD", "DELE"] and any(s in (args or "").lower() for s in ["shadow", "backup", "root"]):
+                result["fake_perm_error"] = True
+                logger.info(f"[Adaptive Engine] Enacted FAKE_PERM_ERROR deception for {command} {args}")
 
         return result
 
@@ -155,10 +174,14 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         return ResponsePlan(FTP_WELCOME_BANNER, 220, "welcome_banner", delay_seconds=delay_seconds)
 
     elif cmd == "USER":
-        username = parameters.get("username", raw_args.strip() or "anonymous")
+        raw_user = (parameters.get("username") or raw_args.strip() or "").strip()
+        username = raw_user if raw_user else "anonymous"
         return ResponsePlan(f"331 Password required for {username}.", 331, "auth_prompt", delay_seconds=delay_seconds)
 
     elif cmd == "PASS":
+        if context.get("authenticated", False):
+            return ResponsePlan("230 Already logged in.", 230, "auth_success", delay_seconds=delay_seconds, extra={"authenticated": True})
+
         failed_attempts = context.get("failed_attempts", 0) + 1
         threshold = context.get("failed_threshold", FAILED_ATTEMPTS_THRESHOLD)
         if failed_attempts <= threshold:
@@ -183,12 +206,16 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         return ResponsePlan(feat_str, 211, "features_list", delay_seconds=delay_seconds)
 
     elif cmd in ["PWD", "XPWD"]:
+        if not context.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
         cwd = context.get("cwd", "/var/www")
         return ResponsePlan(f'257 "{cwd}" is current directory.', 257, "working_directory", delay_seconds=delay_seconds)
 
     elif cmd == "CWD":
         if not context.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        if adaptive_eval.get("fake_perm_error"):
+            return ResponsePlan("550 Permission denied.", 550, "permission_denied", delay_seconds=delay_seconds)
         cwd = context.get("cwd", "/var/www")
         target = raw_args.strip()
         if vfs_instance:
@@ -214,18 +241,27 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         return ResponsePlan("550 Failed to change directory.", 550, "directory_error", delay_seconds=delay_seconds)
 
     elif cmd == "TYPE":
+        if not context.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
         mode = raw_args.strip().upper()
         if mode in ["A", "I"]:
             return ResponsePlan(f"200 Switching to {mode} mode.", 200, "transfer_type", delay_seconds=delay_seconds, extra={"transfer_type": mode})
         return ResponsePlan("504 Command not implemented for that parameter.", 504, "error_response", delay_seconds=delay_seconds)
 
     elif cmd == "PASV":
+        if not context.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
         pasv_str = context.get("pasv_str", "227 Entering Passive Mode.")
         return ResponsePlan(pasv_str, 227, "passive_mode", delay_seconds=delay_seconds)
 
     elif cmd == "PORT":
+        if not context.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
         if context.get("bounce_detected", False):
             return ResponsePlan("501 Illegal PORT command (FTP Bounce Attack detected).", 501, "bounce_attack_blocked", delay_seconds=delay_seconds)
+        p_parts = raw_args.strip().split(",")
+        if len(p_parts) != 6 or not all(p.strip().isdigit() and 0 <= int(p.strip()) <= 255 for p in p_parts):
+            return ResponsePlan("501 Syntax error in parameters or arguments.", 501, "syntax_error", delay_seconds=delay_seconds)
         return ResponsePlan("200 PORT command successful.", 200, "active_mode", delay_seconds=delay_seconds)
 
     elif cmd in ["LIST", "NLST"]:
@@ -236,7 +272,11 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
     elif cmd == "RETR":
         if not context.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        if adaptive_eval.get("fake_perm_error"):
+            return ResponsePlan("550 Permission denied.", 550, "permission_denied", delay_seconds=delay_seconds)
         filename = raw_args.strip()
+        if not filename:
+            return ResponsePlan("501 Syntax error, filename required.", 501, "syntax_error", delay_seconds=delay_seconds)
         cwd = context.get("cwd", "/var/www")
         if vfs_instance:
             target_path = vfs_instance.normalize_path(cwd, filename)
@@ -251,6 +291,15 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
     elif cmd == "STOR":
         if not context.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        filename = raw_args.strip()
+        if not filename:
+            return ResponsePlan("501 Syntax error, filename required.", 501, "syntax_error", delay_seconds=delay_seconds)
+        cwd = context.get("cwd", "/var/www")
+        if vfs_instance:
+            target_path = vfs_instance.normalize_path(cwd, filename)
+            target_node = vfs_instance.get_node(target_path)
+            if target_node and target_node.is_dir:
+                return ResponsePlan("553 Target is a directory.", 553, "file_error", delay_seconds=delay_seconds)
         return ResponsePlan("150 Ok to send data.", 150, "file_upload", delay_seconds=delay_seconds)
 
     elif cmd == "SIZE":
@@ -268,9 +317,19 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         if not context.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
         cwd = context.get("cwd", "/var/www")
+        filename = raw_args.strip()
+        if not filename:
+            return ResponsePlan("501 Syntax error, filename required.", 501, "syntax_error", delay_seconds=delay_seconds)
         if vfs_instance:
-            target_path = vfs_instance.normalize_path(cwd, raw_args.strip())
-            if vfs_instance.remove_node(target_path):
+            target_path = vfs_instance.normalize_path(cwd, filename)
+            node = vfs_instance.get_node(target_path)
+            if node and node.is_dir:
+                return ResponsePlan("550 Cannot delete directory with DELE (use RMD).", 550, "file_error", delay_seconds=delay_seconds)
+            if getattr(vfs_instance, "remove_file", None):
+                removed = vfs_instance.remove_file(target_path)
+            else:
+                removed = vfs_instance.remove_node(target_path)
+            if removed:
                 return ResponsePlan("250 Delete operation successful.", 250, "file_delete", delay_seconds=delay_seconds)
         return ResponsePlan("550 File not found.", 550, "file_error", delay_seconds=delay_seconds)
 
@@ -278,8 +337,13 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         if not context.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
         cwd = context.get("cwd", "/var/www")
+        target = raw_args.strip()
+        if not target:
+            return ResponsePlan("501 Syntax error, directory name required.", 501, "syntax_error", delay_seconds=delay_seconds)
         if vfs_instance:
-            target_path = vfs_instance.normalize_path(cwd, raw_args.strip())
+            target_path = vfs_instance.normalize_path(cwd, target)
+            if vfs_instance.get_node(target_path):
+                return ResponsePlan("550 Directory or file already exists.", 550, "directory_error", delay_seconds=delay_seconds)
             if vfs_instance.create_dir(target_path):
                 return ResponsePlan(f'257 "{target_path}" directory created.', 257, "directory_create", delay_seconds=delay_seconds)
         return ResponsePlan("550 Create directory operation failed.", 550, "directory_error", delay_seconds=delay_seconds)
@@ -288,9 +352,21 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         if not context.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
         cwd = context.get("cwd", "/var/www")
+        target = raw_args.strip()
+        if not target:
+            return ResponsePlan("501 Syntax error, directory name required.", 501, "syntax_error", delay_seconds=delay_seconds)
         if vfs_instance:
-            target_path = vfs_instance.normalize_path(cwd, raw_args.strip())
-            if vfs_instance.remove_node(target_path):
+            target_path = vfs_instance.normalize_path(cwd, target)
+            node = vfs_instance.get_node(target_path)
+            if not node or not node.is_dir:
+                return ResponsePlan("550 Directory not found.", 550, "directory_error", delay_seconds=delay_seconds)
+            if node.children and len(node.children) > 0:
+                return ResponsePlan("550 Directory not empty.", 550, "directory_error", delay_seconds=delay_seconds)
+            if getattr(vfs_instance, "remove_dir", None):
+                removed = vfs_instance.remove_dir(target_path)
+            else:
+                removed = vfs_instance.remove_node(target_path)
+            if removed:
                 return ResponsePlan("250 Remove directory operation successful.", 250, "directory_remove", delay_seconds=delay_seconds)
         return ResponsePlan("550 Directory not found.", 550, "directory_error", delay_seconds=delay_seconds)
 

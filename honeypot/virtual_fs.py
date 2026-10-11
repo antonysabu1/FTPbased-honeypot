@@ -128,6 +128,8 @@ class VirtualFileSystem:
         self._add_node("/home/admin/backup.sql", VirtualNode("backup.sql", is_dir=False, content=backup_sql, owner="admin", group="admin"))
 
     def normalize_path(self, current_cwd, target_path):
+        current_cwd = (current_cwd or "/").replace("\\", "/")
+        target_path = (target_path or "").replace("\\", "/")
         if not target_path:
             return current_cwd
         if target_path.startswith("/"):
@@ -141,6 +143,7 @@ class VirtualFileSystem:
         return normalized
 
     def get_node(self, path):
+        path = (path or "").replace("\\", "/")
         normalized = posixpath.normpath(path)
         if normalized in ["/", ""]:
             return self.root
@@ -155,9 +158,17 @@ class VirtualFileSystem:
 
     def list_dir(self, path):
         node = self.get_node(path)
-        if not node or not node.is_dir:
+        if not node:
             return None
         
+        if not node.is_dir:
+            # File listing (RFC 959 support for LIST on single file)
+            type_flag = "-"
+            perms = node.permissions
+            size = node.size
+            mtime_str = time.strftime("%b %d %H:%M", time.localtime(node.mtime))
+            return [f"{type_flag}{perms} 1 {node.owner} {node.group} {size:8d} {mtime_str} {node.name}"]
+
         entries = []
         for name, child in node.children.items():
             type_flag = "d" if child.is_dir else "-"
@@ -171,8 +182,10 @@ class VirtualFileSystem:
 
     def nlist_dir(self, path):
         node = self.get_node(path)
-        if not node or not node.is_dir:
+        if not node:
             return None
+        if not node.is_dir:
+            return [node.name]
         return list(node.children.keys())
 
     def get_file_content(self, path):
@@ -182,10 +195,13 @@ class VirtualFileSystem:
         return node.content
 
     def add_file(self, path, content, owner="www-data", group="www-data"):
+        path = (path or "").replace("\\", "/")
         normalized = posixpath.normpath(path)
         filename = posixpath.basename(normalized)
+        if not filename or normalized in ["/", ""]:
+            return False
+
         parent_dir = posixpath.dirname(normalized)
-        
         parent_node = self.get_node(parent_dir)
         if not parent_node or not parent_node.is_dir:
             # Create parent directories if needed
@@ -197,12 +213,18 @@ class VirtualFileSystem:
                 curr = curr.children[part]
             parent_node = curr
 
+        # Prevent overwriting an existing directory with a file
+        if filename in parent_node.children and parent_node.children[filename].is_dir:
+            return False
+
         new_node = VirtualNode(filename, is_dir=False, content=content, owner=owner, group=group)
         parent_node.children[filename] = new_node
         return True
 
     def remove_node(self, path):
-        normalized = posixpath.normpath(path)
+        normalized = posixpath.normpath((path or "").replace("\\", "/"))
+        if normalized in ["/", ""]:
+            return False
         filename = posixpath.basename(normalized)
         parent_dir = posixpath.dirname(normalized)
 
@@ -212,13 +234,50 @@ class VirtualFileSystem:
             return True
         return False
 
+    def remove_file(self, path):
+        """DELE: only deletes a file node, never a directory"""
+        normalized = posixpath.normpath((path or "").replace("\\", "/"))
+        if normalized in ["/", ""]:
+            return False
+        filename = posixpath.basename(normalized)
+        parent_dir = posixpath.dirname(normalized)
+
+        parent_node = self.get_node(parent_dir)
+        if parent_node and parent_node.is_dir and filename in parent_node.children:
+            child = parent_node.children[filename]
+            if not child.is_dir:
+                del parent_node.children[filename]
+                return True
+        return False
+
+    def remove_dir(self, path):
+        """RMD: only deletes an empty directory"""
+        normalized = posixpath.normpath((path or "").replace("\\", "/"))
+        if normalized in ["/", ""]:
+            return False
+        filename = posixpath.basename(normalized)
+        parent_dir = posixpath.dirname(normalized)
+
+        parent_node = self.get_node(parent_dir)
+        if parent_node and parent_node.is_dir and filename in parent_node.children:
+            child = parent_node.children[filename]
+            if child.is_dir and len(child.children) == 0:
+                del parent_node.children[filename]
+                return True
+        return False
+
     def create_dir(self, path):
-        normalized = posixpath.normpath(path)
+        normalized = posixpath.normpath((path or "").replace("\\", "/"))
+        if normalized in ["/", ""]:
+            return False
         filename = posixpath.basename(normalized)
         parent_dir = posixpath.dirname(normalized)
 
         parent_node = self.get_node(parent_dir)
         if parent_node and parent_node.is_dir:
+            # Do not overwrite existing file or directory
+            if filename in parent_node.children:
+                return False
             parent_node.children[filename] = VirtualNode(filename, is_dir=True, permissions="rwxr-xr-x")
             return True
         return False

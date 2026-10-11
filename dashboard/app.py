@@ -57,18 +57,11 @@ def get_quarantine():
 
 @app.route("/api/quarantine/preview/<int:file_id>")
 def preview_quarantine_file(file_id):
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM quarantined_files WHERE id = ?", (file_id,))
-    row = cursor.fetchone()
-    conn.close()
-
-    if not row:
+    q_file = db.get_quarantined_file(file_id)
+    if not q_file:
         return jsonify({"error": "File record not found"}), 404
 
-    q_file = dict(row)
     file_path = os.path.join(QUARANTINE_DIR, q_file["quarantine_filename"])
-
     if not os.path.exists(file_path):
         return jsonify({"error": "Quarantined file missing from disk"}), 404
 
@@ -100,21 +93,19 @@ def preview_quarantine_file(file_id):
 
 @app.route("/api/quarantine/download/<int:file_id>")
 def download_quarantine_file(file_id):
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM quarantined_files WHERE id = ?", (file_id,))
-    row = cursor.fetchone()
-    conn.close()
-
-    if not row:
+    q_file = db.get_quarantined_file(file_id)
+    if not q_file:
         abort(404)
 
-    q_file = dict(row)
+    # Sanitize download filename against HTTP response splitting / header injection
+    raw_name = q_file.get("original_filename") or "payload.bin"
+    clean_name = "".join(c for c in raw_name if c.isalnum() or c in "._-") or "payload.bin"
+
     return send_from_directory(
         QUARANTINE_DIR,
         q_file["quarantine_filename"],
         as_attachment=True,
-        download_name=q_file["original_filename"]
+        download_name=clean_name
     )
 
 
