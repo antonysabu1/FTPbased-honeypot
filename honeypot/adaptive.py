@@ -145,17 +145,39 @@ class ResponsePlan:
         }
 
 
+# Autonomous Adapter Session Store (enables decide_response to be called with only 3 arguments per Job 3)
+_adapter_sessions = {}
+
+def get_adapter_session(session_id: str) -> dict:
+    if session_id not in _adapter_sessions:
+        _adapter_sessions[session_id] = {
+            "authenticated": False,
+            "authenticated_user": None,
+            "username": None,
+            "failed_attempts": 0,
+            "cwd": "/var/www",
+            "has_uploaded": False
+        }
+    return _adapter_sessions[session_id]
+
+
 def decide_response(session_id: str, action: str, parameters: dict, context: dict = None) -> ResponsePlan:
     """
     Decides what fake content/behavior to return for this interaction.
-    RIGHT NOW: rule-based & adaptive decision logic for FTP adapter.
-    LATER: internals get replaced with a call into the shared Control Engine.
+    Complies with Adapter Contract Job 3: single choke point seam.
+    Can be called as decide_response(session_id, action, parameters).
     """
     from honeypot.config import FTP_WELCOME_BANNER, FAILED_ATTEMPTS_THRESHOLD
+    from honeypot.virtual_fs import shared_vfs
 
-    context = context or {}
-    vfs_instance = context.get("vfs")
-    has_uploaded = context.get("has_uploaded", False)
+    sess = get_adapter_session(session_id)
+    if context:
+        for k, v in context.items():
+            if v is not None:
+                sess[k] = v
+
+    vfs_instance = sess.get("vfs") or shared_vfs
+    has_uploaded = sess.get("has_uploaded", False)
 
     # Extract command string
     raw_action = (action or "").strip()
@@ -176,14 +198,16 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
     elif cmd == "USER":
         raw_user = (parameters.get("username") or raw_args.strip() or "").strip()
         username = raw_user if raw_user else "anonymous"
+        sess["username"] = username
         return ResponsePlan(f"331 Password required for {username}.", 331, "auth_prompt", delay_seconds=delay_seconds)
 
     elif cmd == "PASS":
-        if context.get("authenticated", False):
+        if sess.get("authenticated", False):
             return ResponsePlan("230 Already logged in.", 230, "auth_success", delay_seconds=delay_seconds, extra={"authenticated": True})
 
-        failed_attempts = context.get("failed_attempts", 0) + 1
-        threshold = context.get("failed_threshold", FAILED_ATTEMPTS_THRESHOLD)
+        failed_attempts = sess.get("failed_attempts", 0) + 1
+        threshold = sess.get("failed_threshold", FAILED_ATTEMPTS_THRESHOLD)
+        sess["failed_attempts"] = failed_attempts
         if failed_attempts <= threshold:
             return ResponsePlan(
                 "530 Login incorrect.", 530, "auth_failure",
@@ -191,7 +215,9 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
                 extra={"authenticated": False, "failed_attempts": failed_attempts}
             )
         else:
-            auth_user = parameters.get("username") or context.get("username") or "anonymous"
+            auth_user = parameters.get("username") or sess.get("username") or "anonymous"
+            sess["authenticated"] = True
+            sess["authenticated_user"] = auth_user
             return ResponsePlan(
                 "230 User logged in, proceed.", 230, "auth_success",
                 delay_seconds=delay_seconds,
@@ -206,22 +232,23 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         return ResponsePlan(feat_str, 211, "features_list", delay_seconds=delay_seconds)
 
     elif cmd in ["PWD", "XPWD"]:
-        if not context.get("authenticated", False):
+        if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
-        cwd = context.get("cwd", "/var/www")
+        cwd = sess.get("cwd", "/var/www")
         return ResponsePlan(f'257 "{cwd}" is current directory.', 257, "working_directory", delay_seconds=delay_seconds)
 
     elif cmd == "CWD":
-        if not context.get("authenticated", False):
+        if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
         if adaptive_eval.get("fake_perm_error"):
             return ResponsePlan("550 Permission denied.", 550, "permission_denied", delay_seconds=delay_seconds)
-        cwd = context.get("cwd", "/var/www")
-        target = raw_args.strip()
+        cwd = sess.get("cwd", "/var/www")
+        target = parameters.get("path") or raw_args.strip()
         if vfs_instance:
             target_path = vfs_instance.normalize_path(cwd, target)
             node = vfs_instance.get_node(target_path)
             if node and node.is_dir:
+                sess["cwd"] = target_path
                 return ResponsePlan(
                     f'250 Directory successfully changed to "{target_path}".', 250, "directory_change",
                     delay_seconds=delay_seconds, extra={"new_cwd": target_path}
@@ -229,11 +256,12 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         return ResponsePlan("550 Failed to change directory.", 550, "directory_error", delay_seconds=delay_seconds)
 
     elif cmd == "CDUP":
-        if not context.get("authenticated", False):
+        if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
-        cwd = context.get("cwd", "/var/www")
+        cwd = sess.get("cwd", "/var/www")
         if vfs_instance:
             target_path = vfs_instance.normalize_path(cwd, "..")
+            sess["cwd"] = target_path
             return ResponsePlan(
                 f'250 Directory successfully changed to "{target_path}".', 250, "directory_change",
                 delay_seconds=delay_seconds, extra={"new_cwd": target_path}
@@ -241,23 +269,23 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         return ResponsePlan("550 Failed to change directory.", 550, "directory_error", delay_seconds=delay_seconds)
 
     elif cmd == "TYPE":
-        if not context.get("authenticated", False):
+        if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
-        mode = raw_args.strip().upper()
+        mode = (parameters.get("type") or raw_args.strip()).upper()
         if mode in ["A", "I"]:
             return ResponsePlan(f"200 Switching to {mode} mode.", 200, "transfer_type", delay_seconds=delay_seconds, extra={"transfer_type": mode})
         return ResponsePlan("504 Command not implemented for that parameter.", 504, "error_response", delay_seconds=delay_seconds)
 
     elif cmd == "PASV":
-        if not context.get("authenticated", False):
+        if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
-        pasv_str = context.get("pasv_str", "227 Entering Passive Mode.")
+        pasv_str = sess.get("pasv_str", "227 Entering Passive Mode.")
         return ResponsePlan(pasv_str, 227, "passive_mode", delay_seconds=delay_seconds)
 
     elif cmd == "PORT":
-        if not context.get("authenticated", False):
+        if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
-        if context.get("bounce_detected", False):
+        if sess.get("bounce_detected", False):
             return ResponsePlan("501 Illegal PORT command (FTP Bounce Attack detected).", 501, "bounce_attack_blocked", delay_seconds=delay_seconds)
         p_parts = raw_args.strip().split(",")
         if len(p_parts) != 6 or not all(p.strip().isdigit() and 0 <= int(p.strip()) <= 255 for p in p_parts):
@@ -265,19 +293,19 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         return ResponsePlan("200 PORT command successful.", 200, "active_mode", delay_seconds=delay_seconds)
 
     elif cmd in ["LIST", "NLST"]:
-        if not context.get("authenticated", False):
+        if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
         return ResponsePlan("150 Here comes the directory listing.", 150, "directory_listing", delay_seconds=delay_seconds)
 
     elif cmd == "RETR":
-        if not context.get("authenticated", False):
+        if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
         if adaptive_eval.get("fake_perm_error"):
             return ResponsePlan("550 Permission denied.", 550, "permission_denied", delay_seconds=delay_seconds)
-        filename = raw_args.strip()
+        filename = parameters.get("path") or parameters.get("filename") or raw_args.strip()
         if not filename:
             return ResponsePlan("501 Syntax error, filename required.", 501, "syntax_error", delay_seconds=delay_seconds)
-        cwd = context.get("cwd", "/var/www")
+        cwd = sess.get("cwd", "/var/www")
         if vfs_instance:
             target_path = vfs_instance.normalize_path(cwd, filename)
             content = vfs_instance.get_file_content(target_path)
@@ -289,12 +317,12 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         return ResponsePlan("550 Failed to open file.", 550, "file_error", delay_seconds=delay_seconds)
 
     elif cmd == "STOR":
-        if not context.get("authenticated", False):
+        if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
-        filename = raw_args.strip()
+        filename = parameters.get("path") or parameters.get("filename") or raw_args.strip()
         if not filename:
             return ResponsePlan("501 Syntax error, filename required.", 501, "syntax_error", delay_seconds=delay_seconds)
-        cwd = context.get("cwd", "/var/www")
+        cwd = sess.get("cwd", "/var/www")
         if vfs_instance:
             target_path = vfs_instance.normalize_path(cwd, filename)
             target_node = vfs_instance.get_node(target_path)
@@ -303,21 +331,22 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         return ResponsePlan("150 Ok to send data.", 150, "file_upload", delay_seconds=delay_seconds)
 
     elif cmd == "SIZE":
-        if not context.get("authenticated", False):
+        if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
-        cwd = context.get("cwd", "/var/www")
+        cwd = sess.get("cwd", "/var/www")
+        target = parameters.get("path") or parameters.get("filename") or raw_args.strip()
         if vfs_instance:
-            target_path = vfs_instance.normalize_path(cwd, raw_args.strip())
+            target_path = vfs_instance.normalize_path(cwd, target)
             node = vfs_instance.get_node(target_path)
             if node and not node.is_dir:
                 return ResponsePlan(f"213 {node.size}", 213, "file_size", delay_seconds=delay_seconds)
         return ResponsePlan("550 Could not get file size.", 550, "file_error", delay_seconds=delay_seconds)
 
     elif cmd == "DELE":
-        if not context.get("authenticated", False):
+        if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
-        cwd = context.get("cwd", "/var/www")
-        filename = raw_args.strip()
+        cwd = sess.get("cwd", "/var/www")
+        filename = parameters.get("path") or parameters.get("filename") or raw_args.strip()
         if not filename:
             return ResponsePlan("501 Syntax error, filename required.", 501, "syntax_error", delay_seconds=delay_seconds)
         if vfs_instance:
@@ -334,10 +363,10 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         return ResponsePlan("550 File not found.", 550, "file_error", delay_seconds=delay_seconds)
 
     elif cmd == "MKD":
-        if not context.get("authenticated", False):
+        if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
-        cwd = context.get("cwd", "/var/www")
-        target = raw_args.strip()
+        cwd = sess.get("cwd", "/var/www")
+        target = parameters.get("path") or raw_args.strip()
         if not target:
             return ResponsePlan("501 Syntax error, directory name required.", 501, "syntax_error", delay_seconds=delay_seconds)
         if vfs_instance:
@@ -349,10 +378,10 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         return ResponsePlan("550 Create directory operation failed.", 550, "directory_error", delay_seconds=delay_seconds)
 
     elif cmd == "RMD":
-        if not context.get("authenticated", False):
+        if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
-        cwd = context.get("cwd", "/var/www")
-        target = raw_args.strip()
+        cwd = sess.get("cwd", "/var/www")
+        target = parameters.get("path") or raw_args.strip()
         if not target:
             return ResponsePlan("501 Syntax error, directory name required.", 501, "syntax_error", delay_seconds=delay_seconds)
         if vfs_instance:
@@ -374,6 +403,7 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         return ResponsePlan("200 OK.", 200, "noop_response", delay_seconds=delay_seconds)
 
     elif cmd == "QUIT":
+        _adapter_sessions.pop(session_id, None)
         return ResponsePlan("221 Goodbye.", 221, "goodbye", delay_seconds=delay_seconds)
 
     return ResponsePlan(f"500 Unknown command '{cmd}'.", 500, "unknown_command", delay_seconds=delay_seconds)

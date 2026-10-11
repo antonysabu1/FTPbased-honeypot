@@ -182,16 +182,33 @@ class FTPControlProtocol(LineReceiver):
         command = parts[0].upper()
         args = parts[1] if len(parts) > 1 else ""
 
-        # Normalize action string and build parameters dict
+        # Normalize action string and build parameters dict per Adapter Contract Job 2
+        clean_args = args.strip()
         if command == "USER":
-            action = f"USER {args.strip()}"
-            parameters = {"username": args.strip(), "raw_args": args}
+            action = f"USER {clean_args}" if clean_args else "USER"
+            parameters = {"command": "USER", "username": clean_args, "raw_args": args}
         elif command == "PASS":
             action = "PASS ******"
-            parameters = {"username": self.username or "unknown", "password": args.strip(), "raw_args": args}
-        elif args:
-            action = f"{command} {args.strip()}"
-            parameters = {"command": command, "path": args.strip(), "raw_args": args}
+            parameters = {"command": "PASS", "username": self.username or "unknown", "password": clean_args, "raw_args": args}
+        elif command in ["CWD", "RETR", "STOR", "SIZE", "DELE", "MKD", "RMD"]:
+            action = f"{command} {clean_args}" if clean_args else command
+            parameters = {"command": command, "path": clean_args, "raw_args": args}
+        elif command == "PORT":
+            action = f"PORT {clean_args}" if clean_args else "PORT"
+            parameters = {"command": "PORT", "raw_args": args}
+            try:
+                p_parts = clean_args.split(",")
+                if len(p_parts) == 6:
+                    parameters["host"] = ".".join(p_parts[:4])
+                    parameters["port"] = int(p_parts[4]) * 256 + int(p_parts[5])
+            except Exception:
+                pass
+        elif command == "TYPE":
+            action = f"TYPE {clean_args}" if clean_args else "TYPE"
+            parameters = {"command": "TYPE", "type": clean_args.upper(), "raw_args": args}
+        elif clean_args:
+            action = f"{command} {clean_args}"
+            parameters = {"command": command, "raw_args": args}
         else:
             action = command
             parameters = {"command": command, "raw_args": args}

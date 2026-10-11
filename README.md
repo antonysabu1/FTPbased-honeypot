@@ -256,8 +256,9 @@ AegisFTP strictly adheres to the **Shared Adapter Contract** standard for plugga
 3. **Job 2a: Session Tracking**:
    - Session boundary matches each connected TCP connection with `session_source: "protocol_native"`.
 4. **Job 3: Single Response Decision Seam (`decide_response()`)**:
-   - All response decision logic goes through `decide_response(session_id, action, parameters, context) -> ResponsePlan`.
-   - Isolates fake response logic behind one single choke point ready for future AI Control Engine integration.
+   - All response decision logic goes through `decide_response(session_id: str, action: str, parameters: dict) -> ResponsePlan`.
+   - Autonomously tracks session state (`_adapter_sessions`) and falls back to virtual filesystem defaults when called without server context.
+   - Isolates fake response logic behind one single choke point ready for seamless drop-in integration with the upcoming shared AI Control Engine.
 
 ### How to Run & Test the FTP Adapter
 

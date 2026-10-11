@@ -281,3 +281,8 @@ class VirtualFileSystem:
             parent_node.children[filename] = VirtualNode(filename, is_dir=True, permissions="rwxr-xr-x")
             return True
         return False
+
+
+# Shared default Virtual File System instance
+shared_vfs = VirtualFileSystem()
+

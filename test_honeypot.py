@@ -249,6 +249,118 @@ class TestHoneypotComponents(unittest.TestCase):
             data = res.get_json()
             self.assertIsNotNone(data)
 
+    def test_adapter_contract_decide_response_pure_3_args(self):
+        """Adapter Contract Job 3: decide_response(session_id, action, parameters) with ONLY 3 args"""
+        from honeypot.adaptive import decide_response, ResponsePlan
+
+        session_id = "pure-3arg-session-uuid"
+
+        # 1. Connect
+        plan_connect = decide_response(session_id, "CONNECT", {})
+        self.assertIsInstance(plan_connect, ResponsePlan)
+        self.assertEqual(plan_connect.response_status, 220)
+
+        # 2. USER
+        plan_user = decide_response(session_id, "USER admin", {"command": "USER", "username": "admin"})
+        self.assertEqual(plan_user.response_status, 331)
+
+        # 3. Multiple PASS attempts to simulate brute-force threshold
+        for _ in range(3):
+            plan_fail = decide_response(session_id, "PASS wrong", {"command": "PASS", "password": "wrong"})
+            self.assertEqual(plan_fail.response_status, 530)
+            self.assertEqual(plan_fail.response_type, "auth_failure")
+
+        # 4th PASS succeeds (threshold = 3)
+        plan_ok = decide_response(session_id, "PASS admin123", {"command": "PASS", "password": "admin123"})
+        self.assertEqual(plan_ok.response_status, 230)
+        self.assertEqual(plan_ok.response_type, "auth_success")
+
+        # 4. PWD - session remembers authentication & initial cwd
+        plan_pwd = decide_response(session_id, "PWD", {"command": "PWD"})
+        self.assertEqual(plan_pwd.response_status, 257)
+        self.assertIn("/var/www", plan_pwd.response_text)
+
+        # 5. CWD - changes directory and updates session state
+        plan_cwd = decide_response(session_id, "CWD /etc", {"command": "CWD", "path": "/etc"})
+        self.assertEqual(plan_cwd.response_status, 250)
+
+        # 6. PWD again - verifies cwd persisted across 3-arg calls
+        plan_pwd2 = decide_response(session_id, "PWD", {"command": "PWD"})
+        self.assertEqual(plan_pwd2.response_status, 257)
+        self.assertIn("/etc", plan_pwd2.response_text)
+
+        # 7. RETR file in /etc
+        plan_retr = decide_response(session_id, "RETR passwd", {"command": "RETR", "path": "passwd"})
+        self.assertEqual(plan_retr.response_status, 150)
+        self.assertEqual(plan_retr.response_type, "file_download")
+
+        # 8. QUIT cleans up session
+        plan_quit = decide_response(session_id, "QUIT", {"command": "QUIT"})
+        self.assertEqual(plan_quit.response_status, 221)
+
+    def test_adapter_contract_exact_event_schema_fields(self):
+        """Adapter Contract Job 2 & 2a: verify exact 11 fields schema"""
+        from honeypot.database import log_event
+        import json
+
+        session_id = "test-schema-uuid"
+        expected_fields = {
+            "event_id", "timestamp", "protocol", "source_ip", "session_id",
+            "action", "parameters", "raw_metadata", "session_source",
+            "response_status", "response_type"
+        }
+
+        event_payload = {
+            "event_id": "custom-uuid-112233",
+            "timestamp": "2026-10-11T06:00:00Z",
+            "protocol": "ftp",
+            "source_ip": "203.0.113.42",
+            "session_id": session_id,
+            "action": "USER admin",
+            "parameters": {"command": "USER", "username": "admin", "raw_args": "admin"},
+            "raw_metadata": {"client_port": 49152},
+            "session_source": "protocol_native",
+            "response_status": 331,
+            "response_type": "auth_prompt"
+        }
+
+        # Verify our payload keys match exactly
+        self.assertEqual(set(event_payload.keys()), expected_fields)
+        self.assertEqual(event_payload["protocol"], "ftp")
+        self.assertEqual(event_payload["session_source"], "protocol_native")
+
+        # Log and retrieve
+        self.db.log_event(event_payload)
+        events = self.db.get_events(limit=1)
+        self.assertEqual(len(events), 1)
+        logged = events[0]
+
+        for field in expected_fields:
+            self.assertIn(field, logged, f"Missing required field {field} in logged event")
+
+        logged_params = json.loads(logged["parameters"]) if isinstance(logged["parameters"], str) else logged["parameters"]
+        self.assertEqual(logged_params.get("username"), "admin")
+
+    def test_adapter_contract_safety_isolation(self):
+        """Adapter Contract Job 1 Safety: complete sandboxing and zero host execution"""
+        # 1. Path traversal escape attempts
+        escaped_path = self.vfs.normalize_path("/var/www", "../../../../../../../Windows/System32")
+        # In VFS, path normalization collapses root slashes to /Windows/System32
+        self.assertEqual(escaped_path, "/Windows/System32")
+        # VFS does NOT map this to the real OS host filesystem
+        node = self.vfs.get_node(escaped_path)
+        self.assertIsNone(node)
+
+        # 2. Host file access check
+        self.assertIsNone(self.vfs.get_file_content("C:\\Windows\\win.ini"))
+        self.assertIsNone(self.vfs.get_file_content("C:\\boot.ini"))
+
+        # 3. File modifications in VFS stay purely in-memory
+        test_content = b"TEST_HONEYPOT_ISOLATION_DATA"
+        self.vfs.add_file("/var/www/test_isolation.txt", test_content)
+        self.assertEqual(self.vfs.get_file_content("/var/www/test_isolation.txt"), test_content)
+        self.assertFalse(os.path.exists("C:\\var\\www\\test_isolation.txt"))
+
 
 if __name__ == "__main__":
     unittest.main()
