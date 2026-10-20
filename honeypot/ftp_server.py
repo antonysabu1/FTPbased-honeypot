@@ -213,10 +213,12 @@ class FTPControlProtocol(LineReceiver):
             action = command
             parameters = {"command": command, "raw_args": args}
 
-        # Setup PASV listener details if PASV command
+        # Setup PASV/EPSV listener details if PASV or EPSV command
         pasv_str = None
         if command == "PASV":
             pasv_str = self._prepare_pasv_response()
+        elif command in ["EPSV", "EPSV4"]:
+            pasv_str = self._prepare_epsv_response()
 
         # Check bounce attack if PORT command
         bounce_detected = False
@@ -320,6 +322,44 @@ class FTPControlProtocol(LineReceiver):
         p1 = self.pasv_port // 256
         p2 = self.pasv_port % 256
         return f"227 Entering Passive Mode ({ip_parts[0]},{ip_parts[1]},{ip_parts[2]},{ip_parts[3]},{p1},{p2})."
+
+    def _prepare_epsv_response(self):
+        """Extended Passive Mode (RFC 2428): same listener setup as PASV,
+        just a different, IP-less response format."""
+        self.close_pasv_listener()
+
+        bound_port = None
+        listener = None
+        factory = FTPDataServerFactory()
+
+        import socket
+        for p in range(PASV_PORT_MIN, PASV_PORT_MAX + 1):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                s.bind((FTP_HOST, p))
+                s.close()
+            except Exception:
+                s.close()
+                continue
+            try:
+                listener = reactor.listenTCP(p, factory, interface=FTP_HOST)
+                bound_port = p
+                break
+            except Exception:
+                continue
+
+        if not listener:
+            try:
+                listener = reactor.listenTCP(0, factory, interface=FTP_HOST)
+                bound_port = listener.getHost().port
+            except Exception:
+                return None
+
+        self.pasv_listener = listener
+        self.pasv_factory = factory
+        self.pasv_port = bound_port
+
+        return f"229 Entering Extended Passive Mode (|||{bound_port}|)."
 
     def _dispatch_plan(self, command, args, plan):
         if command == "USER":
@@ -482,6 +522,74 @@ class FTPControlProtocol(LineReceiver):
                 self.close_pasv_listener()
 
             data_d.addCallbacks(on_data_received, on_error)
+
+        elif command == "APPE":
+            if plan.response_status != 150:
+                self.sendLine(plan.response_text.encode('utf-8'))
+                return
+
+            filename = args.strip()
+            if not filename:
+                self.sendLine(b"501 Syntax error, filename required.")
+                return
+
+            vfs_path = vfs.normalize_path(self.cwd, filename)
+            existing_content = vfs.get_file_content(vfs_path) or b""
+
+            self.sendLine(plan.response_text.encode('utf-8'))
+            data_d = self._get_data_connection(mode='RECV')
+
+            def on_data_received(received_bytes):
+                if received_bytes is None:
+                    received_bytes = b""
+
+                full_content = existing_content + received_bytes
+                sha256_hash = hashlib.sha256(full_content).hexdigest()
+                timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                safe_raw = os.path.basename(vfs_path.replace("\\", "/"))
+                safe_basename = re.sub(r'[^a-zA-Z0-9._-]', '_', safe_raw) or "payload.bin"
+                quarantine_filename = f"{timestamp}_{sha256_hash[:8]}_{safe_basename}"
+                quarantine_path = os.path.join(QUARANTINE_DIR, quarantine_filename)
+
+                try:
+                    with open(quarantine_path, "wb") as f:
+                        f.write(full_content)
+                except Exception as e:
+                    logger.error(f"Failed to write quarantined file {quarantine_path}: {e}")
+
+                yara_matches = threat_intel.scan_yara_rules(quarantine_path)
+                yara_str = ",".join(yara_matches)
+
+                db.log_quarantined_file(
+                    self.session_id,
+                    self.client_ip,
+                    safe_basename,
+                    quarantine_filename,
+                    len(full_content),
+                    sha256_hash,
+                    yara_str
+                )
+
+                vfs.add_file(vfs_path, full_content, owner=self.authenticated_user or "www-data")
+                self.has_uploaded = True
+
+                threads.deferToThread(
+                    alert_notifier.notify_payload_uploaded,
+                    self.client_ip, safe_basename, sha256_hash, len(full_content), self.geo_info, yara_matches
+                )
+
+                self.sendLine(b"226 File receive OK.")
+                self.close_pasv_listener()
+
+            def on_error(err):
+                self.sendLine(b"425 Data connection failed.")
+                self.close_pasv_listener()
+
+            data_d.addCallbacks(on_data_received, on_error)
+
+        elif command == "ABOR":
+            self.close_pasv_listener()
+            self.sendLine(plan.response_text.encode('utf-8'))
 
         elif command == "QUIT":
             self.sendLine(plan.response_text.encode('utf-8'))
