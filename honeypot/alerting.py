@@ -62,12 +62,12 @@ class WebhookAlertNotifier:
         msg = f"• *Attacker IP*: `{client_ip}`\n• *Country*: {geo_info.get('country')} ({geo_info.get('country_code')})\n• *ISP*: {geo_info.get('isp')}"
         self.send_alert(title, msg, severity="INFO")
 
-    def notify_brute_force_threshold(self, client_ip, failed_attempts, username, password):
+    def notify_brute_force_threshold(self, client_ip, failed_attempts, username, password_hash):
         title = "Brute-Force Threshold Exceeded (Access Granted Trap)"
         msg = (
             f"• *Attacker IP*: `{client_ip}`\n"
             f"• *Failed Attempts*: {failed_attempts}\n"
-            f"• *Trapped Credential*: User: `{username}` | Pass: `{password}`\n"
+            f"• *Trapped Credential*: User: `{username}` | Pass (SHA-256): `{password_hash}`\n"
             f"• *Status*: Accepted into Virtual Filesystem"
         )
         self.send_alert(title, msg, severity="HIGH")

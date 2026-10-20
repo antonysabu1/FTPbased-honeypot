@@ -189,7 +189,7 @@ class FTPControlProtocol(LineReceiver):
             parameters = {"command": "USER", "username": clean_args, "raw_args": args}
         elif command == "PASS":
             action = "PASS ******"
-            parameters = {"command": "PASS", "username": self.username or "unknown", "password": clean_args, "raw_args": args}
+            parameters = {"command": "PASS", "username": self.username or "unknown", "password_sha256": hashlib.sha256(clean_args.encode("utf-8")).hexdigest(), "raw_args": "******"}
         elif command in ["CWD", "RETR", "STOR", "SIZE", "DELE", "MKD", "RMD"]:
             action = f"{command} {clean_args}" if clean_args else command
             parameters = {"command": command, "path": clean_args, "raw_args": args}
@@ -329,19 +329,20 @@ class FTPControlProtocol(LineReceiver):
 
         elif command == "PASS":
             password = args.strip()
+            password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
             self.failed_attempts = plan.extra.get("failed_attempts", self.failed_attempts + 1)
             is_auth = plan.extra.get("authenticated", False)
             if is_auth:
                 self.authenticated = True
                 self.authenticated_user = plan.extra.get("authenticated_user", self.username or "anonymous")
-                db.log_auth_attempt(self.session_id, self.client_ip, self.username or "unknown", password, True, self.failed_attempts)
+                db.log_auth_attempt(self.session_id, self.client_ip, self.username or "unknown", password_hash, True, self.failed_attempts)
                 db.update_session_auth(self.session_id, self.failed_attempts, self.authenticated_user)
                 threads.deferToThread(
                     alert_notifier.notify_brute_force_threshold,
-                    self.client_ip, self.failed_attempts, self.username or "unknown", password
+                    self.client_ip, self.failed_attempts, self.username or "unknown", password_hash
                 )
             else:
-                db.log_auth_attempt(self.session_id, self.client_ip, self.username or "unknown", password, False, self.failed_attempts)
+                db.log_auth_attempt(self.session_id, self.client_ip, self.username or "unknown", password_hash, False, self.failed_attempts)
                 db.update_session_auth(self.session_id, self.failed_attempts)
 
             self.sendLine(plan.response_text.encode('utf-8'))
