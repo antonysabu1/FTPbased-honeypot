@@ -93,17 +93,46 @@ class AdaptiveDeceptionEngine:
             logger.info(f"[Adaptive Engine] Tarpitting session {session_id[:8]} for {result['delay_seconds']}s")
 
         elif action == "DYNAMIC_INJECTION":
-            # Dynamically inject fake database backup if attacker is probing config.php
-            if command == "RETR" and "config.php" in (args or "").lower():
-                injected_path = "/var/www/database_backup.sql"
-                backup_sql_content = (
-                    "-- AegisFTP Dynamic Deception Trap Dump\n"
-                    "CREATE TABLE admin_credentials (id INT, email VARCHAR(100), pass_hash VARCHAR(255));\n"
-                    "INSERT INTO admin_credentials VALUES (1, 'sysadmin@internal-corp.local', '$2y$10$e8N3v...fakehash');\n"
-                )
-                vfs_instance.add_file(injected_path, backup_sql_content.encode('utf-8'), owner="www-data")
-                result["injected_file"] = injected_path
-                logger.info(f"[Adaptive Engine] Injected honeypot asset {injected_path} into VFS for session {session_id[:8]}")
+            # Dynamically inject a believable honeypot asset based on which
+            # sensitive file the attacker is probing (covers every keyword
+            # that can trigger SENSITIVE_FILE_PROBING, not just config.php).
+            args_lower = (args or "").lower()
+            injection_map = [
+                ("config.php", "/var/www/database_backup.sql",
+                 "-- AegisFTP Dynamic Deception Trap Dump\n"
+                 "CREATE TABLE admin_credentials (id INT, email VARCHAR(100), pass_hash VARCHAR(255));\n"
+                 "INSERT INTO admin_credentials VALUES (1, 'sysadmin@internal-corp.local', '$2y$10$e8N3v...fakehash');\n",
+                 "www-data"),
+                ("passwd", "/etc/passwd.bak",
+                 "root:x:0:0:root:/root:/bin/bash\n"
+                 "backup-admin:x:1500:1500:Backup Service Account:/home/backup-admin:/bin/bash\n"
+                 "svc-deploy:x:1501:1501:Deploy Automation:/home/svc-deploy:/bin/bash\n",
+                 "root"),
+                ("shadow", "/root/.ssh/id_rsa.bak",
+                 "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                 "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn\n"
+                 "NhAAAAAwEAAQAAAYEA0fakehoneypottrapkeycontentdonotusethisanywhererea\n"
+                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
+                 "-----END OPENSSH PRIVATE KEY-----\n",
+                 "root"),
+                ("backup", "/home/admin/db_credentials.txt",
+                 "# Production DB Credentials - DO NOT COMMIT\n"
+                 "DB_HOST=10.0.4.12\n"
+                 "DB_USER=dbadmin\n"
+                 "DB_PASS=Tr4pp3d-Cr3dent1al-2026!\n",
+                 "admin"),
+            ]
+
+            if command == "RETR":
+                for keyword, injected_path, content, owner in injection_map:
+                    if keyword in args_lower:
+                        vfs_instance.add_file(injected_path, content.encode('utf-8'), owner=owner)
+                        result["injected_file"] = injected_path
+                        logger.info(
+                            f"[Adaptive Engine] Injected honeypot asset {injected_path} into VFS "
+                            f"for session {session_id[:8]} (probe keyword: {keyword})"
+                        )
+                        break
 
         elif action == "FAKE_PERM_ERROR":
             if command in ["RETR", "CWD", "DELE"] and any(s in (args or "").lower() for s in ["shadow", "backup", "root"]):
