@@ -235,7 +235,15 @@ class TestHoneypotComponents(unittest.TestCase):
 
     def test_flask_dashboard_endpoints(self):
         from dashboard.app import app
+        import base64
+        from honeypot.config import DASHBOARD_USERNAME, DASHBOARD_PASSWORD
         client = app.test_client()
+        # Issue 2: the dashboard now requires HTTP Basic Auth on every
+        # route. Authenticate this test client once so the existing
+        # endpoint assertions below keep exercising real route behavior
+        # instead of just hitting 401 everywhere.
+        creds = base64.b64encode(f"{DASHBOARD_USERNAME}:{DASHBOARD_PASSWORD}".encode()).decode()
+        client.environ_base["HTTP_AUTHORIZATION"] = f"Basic {creds}"
 
         # UI Root
         res_ui = client.get("/")
@@ -851,6 +859,45 @@ class TestHoneypotComponents(unittest.TestCase):
                 has_uploaded=False, client_ip=test_ip
             )
             self.assertNotEqual(result["action"], "NORMAL_RESPONSE")
+
+
+    def test_dashboard_requires_auth(self):
+        """Issue 2: dashboard routes reject requests with no credentials."""
+        from dashboard.app import app as dashboard_app
+        client = dashboard_app.test_client()
+        resp = client.get("/api/stats")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_dashboard_accepts_correct_credentials(self):
+        """Issue 2: the configured username/password lets requests through."""
+        import base64
+        from dashboard.app import app as dashboard_app
+        from honeypot.config import DASHBOARD_USERNAME, DASHBOARD_PASSWORD
+        client = dashboard_app.test_client()
+        creds = base64.b64encode(f"{DASHBOARD_USERNAME}:{DASHBOARD_PASSWORD}".encode()).decode()
+        resp = client.get("/api/stats", headers={"Authorization": f"Basic {creds}"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_dashboard_rejects_wrong_password(self):
+        """Issue 2: a wrong password must not be let through."""
+        import base64
+        from dashboard.app import app as dashboard_app
+        from honeypot.config import DASHBOARD_USERNAME
+        client = dashboard_app.test_client()
+        creds = base64.b64encode(f"{DASHBOARD_USERNAME}:wrong-password".encode()).decode()
+        resp = client.get("/api/stats", headers={"Authorization": f"Basic {creds}"})
+        self.assertEqual(resp.status_code, 401)
+
+    def test_data_and_quarantine_dirs_restricted_to_owner(self):
+        """Issue 2: DATA_DIR/QUARANTINE_DIR must not be group/world
+        readable -- they hold trapped credentials and quarantined
+        malware."""
+        import os
+        import stat
+        from honeypot.config import DATA_DIR, QUARANTINE_DIR
+        for d in [DATA_DIR, QUARANTINE_DIR]:
+            mode = stat.S_IMODE(os.stat(d).st_mode)
+            self.assertEqual(mode & 0o077, 0, f"{d} is accessible to group/other (mode {oct(mode)})")
 
 
 if __name__ == "__main__":

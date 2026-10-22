@@ -63,11 +63,16 @@ class WebhookAlertNotifier:
         self.send_alert(title, msg, severity="INFO")
 
     def notify_brute_force_threshold(self, client_ip, failed_attempts, username, password_hash):
+        # Issue 2: a password hash is still a credential artifact worth
+        # protecting -- a leaked webhook (shared chat, logging proxy,
+        # compromised bot token) shouldn't hand out even a hashed
+        # password. It stays in the local DB for forensic review; it's
+        # just kept out of outbound alert payloads.
         title = "Brute-Force Threshold Exceeded (Access Granted Trap)"
         msg = (
             f"• *Attacker IP*: `{client_ip}`\n"
             f"• *Failed Attempts*: {failed_attempts}\n"
-            f"• *Trapped Credential*: User: `{username}` | Pass (SHA-256): `{password_hash}`\n"
+            f"• *Trapped Credential*: User: `{username}` | Pass: `[REDACTED]`\n"
             f"• *Status*: Accepted into Virtual Filesystem"
         )
         self.send_alert(title, msg, severity="HIGH")

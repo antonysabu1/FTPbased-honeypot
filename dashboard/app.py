@@ -1,11 +1,42 @@
 import os
 import binascii
-from flask import Flask, render_template, jsonify, request, send_from_directory, abort
-from honeypot.config import DASHBOARD_HOST, DASHBOARD_PORT, SECRET_KEY, QUARANTINE_DIR
+import secrets
+import logging
+from flask import Flask, render_template, jsonify, request, send_from_directory, abort, Response
+from honeypot.config import DASHBOARD_HOST, DASHBOARD_PORT, SECRET_KEY, QUARANTINE_DIR, DASHBOARD_USERNAME, DASHBOARD_PASSWORD
 from honeypot.database import db
+
+logger = logging.getLogger("AegisFTP.Dashboard")
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["SECRET_KEY"] = SECRET_KEY
+
+if DASHBOARD_PASSWORD == "aegisftp-change-me":
+    logger.warning(
+        "[Dashboard] DASHBOARD_PASSWORD is not set -- using the default "
+        "credentials (admin / aegisftp-change-me). Set DASHBOARD_USERNAME "
+        "and DASHBOARD_PASSWORD env vars before exposing this dashboard "
+        "beyond localhost."
+    )
+
+
+@app.before_request
+def enforce_dashboard_auth():
+    """Issue 2: the dashboard shows attacker IPs, trapped credentials and
+    quarantined malware -- it must not be reachable by anyone who can
+    just hit the port. HTTP Basic Auth, checked with a constant-time
+    comparison to avoid a timing side-channel on the password."""
+    auth = request.authorization
+    valid = (
+        auth is not None
+        and secrets.compare_digest(auth.username or "", DASHBOARD_USERNAME)
+        and secrets.compare_digest(auth.password or "", DASHBOARD_PASSWORD)
+    )
+    if not valid:
+        return Response(
+            "Authentication required", 401,
+            {"WWW-Authenticate": 'Basic realm="AegisFTP Dashboard"'}
+        )
 
 
 @app.route("/")
