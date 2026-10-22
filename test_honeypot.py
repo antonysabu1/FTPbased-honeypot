@@ -718,5 +718,84 @@ class TestHoneypotComponents(unittest.TestCase):
         self.assertEqual(state, "HIGH_FREQUENCY_SCAN")
 
 
+    def test_update_q_value_follows_bellman_equation(self):
+        """Issue 4: verify the Bellman update computes the expected value,
+        not just that calling it doesn't crash."""
+        from honeypot.adaptive import AdaptiveDeceptionEngine
+        engine = AdaptiveDeceptionEngine()
+        state, action, next_state = "LOW_ACTIVITY", "NORMAL_RESPONSE", "LOW_ACTIVITY"
+        alpha, gamma = 0.1, 0.9
+        old_q = engine.q_table[state][action]
+        max_next = max(engine.q_table[next_state].values())
+        reward = 4.0
+        expected = round(old_q + alpha * (reward + gamma * max_next - old_q), 4)
+        engine.update_q_value(state, action, reward, next_state, alpha=alpha, gamma=gamma)
+        self.assertEqual(engine.q_table[state][action], expected)
+
+    def test_q_loop_closes_across_two_turns(self):
+        """Issue 4: the engine must actually update a Q-value as a
+        consequence of a real evaluate_response -> evaluate_response pair
+        of calls (the full closed loop), not just when update_q_value is
+        called directly in isolation."""
+        from honeypot.adaptive import AdaptiveDeceptionEngine
+        engine = AdaptiveDeceptionEngine()
+        session_id = "qloop-session"
+
+        before = {s: dict(a) for s, a in engine.q_table.items()}
+        engine.evaluate_response(session_id, "NOOP", "", self.vfs, has_uploaded=False)
+        engine.evaluate_response(session_id, "NOOP", "", self.vfs, has_uploaded=False)
+
+        self.assertNotEqual(engine.q_table, before)
+
+    def test_reward_rewards_bait_interaction_more_than_ordinary_command(self):
+        """Issue 4: taking the bait from a prior DYNAMIC_INJECTION must
+        score higher than an unrelated ordinary command (the issue's
+        "Successful deception or engagement" signal)."""
+        from honeypot.adaptive import AdaptiveDeceptionEngine
+        engine = AdaptiveDeceptionEngine()
+        session = {"cmd_count": 1, "injected_paths": {"database_backup.sql"}}
+        ordinary_reward = engine._compute_reward("PWD", "", session)
+        bait_reward = engine._compute_reward("RETR", "database_backup.sql", session)
+        self.assertGreater(bait_reward, ordinary_reward)
+
+    def test_reward_penalizes_quit(self):
+        """Issue 4: session termination is a negative outcome signal."""
+        from honeypot.adaptive import AdaptiveDeceptionEngine
+        engine = AdaptiveDeceptionEngine()
+        session = {"cmd_count": 5, "injected_paths": set()}
+        reward = engine._compute_reward("QUIT", "", session)
+        self.assertLess(reward, 0)
+
+    def test_reward_rewards_destructive_commands_as_engagement_signal(self):
+        """Issue 4: destructive/suspicious commands are still valuable
+        threat-intel signal, per the issue's own list of reward sources."""
+        from honeypot.adaptive import AdaptiveDeceptionEngine
+        engine = AdaptiveDeceptionEngine()
+        session = {"cmd_count": 3, "injected_paths": set()}
+        base_reward = engine._compute_reward("PWD", "", session)
+        dele_reward = engine._compute_reward("DELE", "somefile.txt", session)
+        stor_shell_reward = engine._compute_reward("STOR", "shell.php", session)
+        self.assertGreater(dele_reward, base_reward)
+        self.assertGreater(stor_shell_reward, base_reward)
+
+    def test_cleanup_session_clears_all_tracking_dicts(self):
+        """Issue 4 (bonus): QUIT must not leak per-session engine state
+        forever in a long-running process."""
+        from honeypot.adaptive import AdaptiveDeceptionEngine
+        engine = AdaptiveDeceptionEngine()
+        session_id = "cleanup-session"
+        engine.evaluate_response(session_id, "NOOP", "", self.vfs, has_uploaded=False)
+        self.assertIn(session_id, engine.session_qlearn)
+        self.assertIn(session_id, engine.session_states)
+        self.assertIn(session_id, engine.session_cmd_timestamps)
+
+        engine.cleanup_session(session_id)
+
+        self.assertNotIn(session_id, engine.session_qlearn)
+        self.assertNotIn(session_id, engine.session_states)
+        self.assertNotIn(session_id, engine.session_cmd_timestamps)
+        self.assertNotIn(session_id, engine.session_scan_thresholds)
+
+
 if __name__ == "__main__":
     unittest.main()

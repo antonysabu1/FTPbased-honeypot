@@ -47,6 +47,7 @@ class AdaptiveDeceptionEngine:
         self.session_cmd_timestamps = {}
         self.session_states = {}
         self.session_scan_thresholds = {}  # Issue 5: per-session randomized scan-detection threshold
+        self.session_qlearn = {}  # Issue 4: per-session Q-learning loop state (cmd_count, injected bait, pending (state, action) awaiting reward)
 
     def _get_scan_threshold(self, session_id):
         """Issue 5: each session gets its own randomized command-rate
@@ -91,27 +92,76 @@ class AdaptiveDeceptionEngine:
             state_actions = self.q_table.get(state, {})
             return max(state_actions, key=state_actions.get) if state_actions else "NORMAL_RESPONSE"
 
+    def _compute_reward(self, command, args, session):
+        """Issue 4: reward based on the attacker's OBSERVED behavior
+        following the previous action (dwell time / continued engagement,
+        taking bait from an earlier DYNAMIC_INJECTION, running a
+        suspicious/destructive command, or disconnecting), rather than a
+        guess made the instant the action was chosen. Called one turn
+        late, once the consequence of that action is actually visible."""
+        cmd = (command or "").upper()
+        args_lower = (args or "").lower()
+
+        if cmd == "QUIT":
+            # The attacker disconnected right after the previous action --
+            # a (mild) failure to retain engagement.
+            return -3.0
+
+        reward = 1.0  # base: the attacker sent another command at all (dwell time)
+
+        # Engagement depth: more commands this session = more intel
+        # extracted, with diminishing returns.
+        reward += 0.5 * min(session.get("cmd_count", 0), 20) / 20.0
+
+        # Successful deception: the attacker is retrieving/probing a file
+        # this engine planted earlier in the session via DYNAMIC_INJECTION.
+        injected_paths = session.get("injected_paths", set())
+        if cmd in ["RETR", "SIZE", "MDTM"] and any(name in args_lower for name in injected_paths):
+            reward += 5.0
+
+        # Suspicious/destructive activity is still valuable threat intel --
+        # it means the attacker is actively engaging rather than idling.
+        if cmd in ["DELE", "RMD"]:
+            reward += 2.0
+        if cmd == "STOR" and any(ext in args_lower for ext in [".php", ".sh", ".py", ".pl", ".exe", ".elf", ".asp", ".jsp"]):
+            reward += 2.0
+
+        return reward
+
     def evaluate_response(self, session_id, command, args, vfs_instance, has_uploaded=False):
         """
-        Determines response modification (delay, dynamic file creation, or response code modification)
-        and runs dynamic Q-learning updates.
+        Determines response modification (delay, dynamic file creation, or
+        response code modification) for the CURRENT command, and closes the
+        Q-learning feedback loop for the PREVIOUS command's action (Issue 4)
+        using richer, observed attacker-behavior signals instead of a
+        reward guessed the instant the action was chosen.
         """
-        prev_state = self.session_states.get(session_id, "LOW_ACTIVITY")
-        state = self.get_session_state(session_id, command, args, has_uploaded)
+        from honeypot.config import BASELINE_JITTER_MIN_SECONDS, BASELINE_JITTER_MAX_SECONDS
+
+        qlearn = self.session_qlearn.setdefault(session_id, {
+            "cmd_count": 0,
+            "injected_paths": set(),
+            "pending_state": None,
+            "pending_action": None,
+        })
+        qlearn["cmd_count"] += 1
+
+        # Close the loop on the PREVIOUS action now that its consequence
+        # (this command) is observable, then compute the CURRENT state.
+        if qlearn["pending_state"] is not None and qlearn["pending_action"] is not None:
+            reward = self._compute_reward(command, args, qlearn)
+            state = self.get_session_state(session_id, command, args, has_uploaded)
+            self.update_q_value(qlearn["pending_state"], qlearn["pending_action"], reward, state)
+        else:
+            state = self.get_session_state(session_id, command, args, has_uploaded)
+
         self.session_states[session_id] = state
         action = self.select_action(state)
 
-        # Update Q-values dynamically based on deception outcome
-        reward = 1.0
-        if state == "PAYLOAD_UPLOADED":
-            reward = 10.0
-        elif state == "SENSITIVE_FILE_PROBING":
-            reward = 5.0
-        elif state == "HIGH_FREQUENCY_SCAN" and action == "TARPIT_DELAY":
-            reward = 8.0
-        self.update_q_value(prev_state, action, reward, state)
-
-        from honeypot.config import BASELINE_JITTER_MIN_SECONDS, BASELINE_JITTER_MAX_SECONDS
+        # Stash this turn's (state, action) so the NEXT call can reward it
+        # once its actual consequence has been observed.
+        qlearn["pending_state"] = state
+        qlearn["pending_action"] = action
 
         result = {
             "state": state,
@@ -166,6 +216,9 @@ class AdaptiveDeceptionEngine:
                     if keyword in args_lower:
                         vfs_instance.add_file(injected_path, content.encode('utf-8'), owner=owner)
                         result["injected_file"] = injected_path
+                        # Issue 4: remember this bait so a later RETR/SIZE/MDTM
+                        # on it scores as successful deception in _compute_reward.
+                        qlearn["injected_paths"].add(injected_path.rsplit("/", 1)[-1].lower())
                         logger.info(
                             f"[Adaptive Engine] Injected honeypot asset {injected_path} into VFS "
                             f"for session {session_id[:8]} (probe keyword: {keyword})"
@@ -185,6 +238,14 @@ class AdaptiveDeceptionEngine:
         current_q = self.q_table[state][action]
         new_q = current_q + alpha * (reward + gamma * max_next - current_q)
         self.q_table[state][action] = round(new_q, 4)
+
+    def cleanup_session(self, session_id):
+        """Drop all per-session tracking state. Called on QUIT so these
+        dicts don't grow unbounded over a long-running honeypot process."""
+        self.session_cmd_timestamps.pop(session_id, None)
+        self.session_states.pop(session_id, None)
+        self.session_scan_thresholds.pop(session_id, None)
+        self.session_qlearn.pop(session_id, None)
 
 adaptive_engine = AdaptiveDeceptionEngine()
 
@@ -725,6 +786,7 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
 
     elif cmd == "QUIT":
         _adapter_sessions.pop(session_id, None)
+        adaptive_engine.cleanup_session(session_id)
         return ResponsePlan("221 Goodbye.", 221, "goodbye", delay_seconds=delay_seconds)
 
     return ResponsePlan(f"500 Unknown command '{cmd}'.", 500, "unknown_command", delay_seconds=delay_seconds)
