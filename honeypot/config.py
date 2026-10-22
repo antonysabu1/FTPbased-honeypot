@@ -1,4 +1,6 @@
 import os
+import sys
+import secrets
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -30,11 +32,27 @@ DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", 5000))
 SECRET_KEY = os.environ.get("SECRET_KEY", "ftp-honeypot-secret-key-2026")
 
 # Issue 2: the dashboard shows attacker IPs, trapped credentials and
-# quarantined malware -- it must not be reachable without a login. Set
-# these via environment variables before exposing the dashboard beyond
-# localhost; the defaults are only safe for local development.
+# quarantined malware -- it must not be reachable without a login. A
+# hardcoded default password here would itself be a committed secret
+# (flagged by GitGuardian on the first draft of this fix), so instead:
+# use DASHBOARD_PASSWORD from the environment if set, otherwise generate
+# a fresh random one every run and print it once so the operator can
+# actually log in. Set DASHBOARD_USERNAME/DASHBOARD_PASSWORD explicitly
+# for a password that survives restarts.
 DASHBOARD_USERNAME = os.environ.get("DASHBOARD_USERNAME", "admin")
-DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "aegisftp-change-me")
+_dashboard_password_env = os.environ.get("DASHBOARD_PASSWORD")
+if _dashboard_password_env:
+    DASHBOARD_PASSWORD = _dashboard_password_env
+else:
+    DASHBOARD_PASSWORD = secrets.token_urlsafe(18)
+    print(
+        f"[AegisFTP] DASHBOARD_PASSWORD not set -- generated a random "
+        f"dashboard password for this run (user: {DASHBOARD_USERNAME}): "
+        f"{DASHBOARD_PASSWORD}\n"
+        f"[AegisFTP] Set DASHBOARD_USERNAME/DASHBOARD_PASSWORD env vars "
+        f"for a password that survives restarts.",
+        file=sys.stderr
+    )
 
 # Server Banner
 FTP_WELCOME_BANNER = os.environ.get("FTP_WELCOME_BANNER", "220 ProFTPD 1.3.5a Server (Debian FTP Server)")

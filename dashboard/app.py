@@ -11,15 +11,6 @@ logger = logging.getLogger("AegisFTP.Dashboard")
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["SECRET_KEY"] = SECRET_KEY
 
-if DASHBOARD_PASSWORD == "aegisftp-change-me":
-    logger.warning(
-        "[Dashboard] DASHBOARD_PASSWORD is not set -- using the default "
-        "credentials (admin / aegisftp-change-me). Set DASHBOARD_USERNAME "
-        "and DASHBOARD_PASSWORD env vars before exposing this dashboard "
-        "beyond localhost."
-    )
-
-
 @app.before_request
 def enforce_dashboard_auth():
     """Issue 2: the dashboard shows attacker IPs, trapped credentials and
