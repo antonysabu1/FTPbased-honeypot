@@ -458,5 +458,40 @@ class TestHoneypotComponents(unittest.TestCase):
         self.assertEqual(plan.response_status, 226)
         self.assertEqual(plan.response_type, "abort_transfer")
 
+    def test_stat_help_mode_stru_site_responses(self):
+        from honeypot.adaptive import decide_response
+        session_id = "test-misc-session"
+        ctx = {"authenticated": True}
+
+        plan_stat = decide_response(session_id, "STAT", {"command": "STAT", "raw_args": ""}, context=ctx)
+        self.assertEqual(plan_stat.response_status, 211)
+        self.assertIn("FTP server status", plan_stat.response_text)
+
+        plan_help = decide_response(session_id, "HELP", {"command": "HELP"}, context=ctx)
+        self.assertEqual(plan_help.response_status, 214)
+        self.assertIn("RNFR", plan_help.response_text)
+
+        plan_mode_ok = decide_response(session_id, "MODE S", {"command": "MODE", "raw_args": "S"}, context=ctx)
+        self.assertEqual(plan_mode_ok.response_status, 200)
+        plan_mode_bad = decide_response(session_id, "MODE Z", {"command": "MODE", "raw_args": "Z"}, context=ctx)
+        self.assertEqual(plan_mode_bad.response_status, 504)
+
+        plan_stru_ok = decide_response(session_id, "STRU F", {"command": "STRU", "raw_args": "F"}, context=ctx)
+        self.assertEqual(plan_stru_ok.response_status, 200)
+        plan_stru_bad = decide_response(session_id, "STRU R", {"command": "STRU", "raw_args": "R"}, context=ctx)
+        self.assertEqual(plan_stru_bad.response_status, 504)
+
+        plan_site_chmod = decide_response(session_id, "SITE CHMOD 755 file.txt", {"command": "SITE", "raw_args": "CHMOD 755 file.txt"}, context=ctx)
+        self.assertEqual(plan_site_chmod.response_status, 200)
+        plan_site_unknown = decide_response(session_id, "SITE FOO", {"command": "SITE", "raw_args": "FOO"}, context=ctx)
+        self.assertEqual(plan_site_unknown.response_status, 502)
+
+    def test_unknown_command_fallback_still_works(self):
+        from honeypot.adaptive import decide_response
+        plan = decide_response("test-unknown-session", "FOOBAR", {"command": "FOOBAR"}, context={"authenticated": True})
+        self.assertEqual(plan.response_status, 500)
+        self.assertEqual(plan.response_type, "unknown_command")
+
+
 if __name__ == "__main__":
     unittest.main()
