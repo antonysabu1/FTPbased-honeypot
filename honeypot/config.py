@@ -40,6 +40,16 @@ FTP_WELCOME_BANNER = os.environ.get("FTP_WELCOME_BANNER", "220 ProFTPD 1.3.5a Se
 # stays interactive.
 MAX_DESTRUCTIVE_OPS_PER_SESSION = int(os.environ.get("MAX_DESTRUCTIVE_OPS_PER_SESSION", 10))
 
+# Tarpit timing side-channel mitigation (Issue 5). The HIGH_FREQUENCY_SCAN
+# command-rate trigger is randomized per session instead of a single fixed
+# global threshold, and a small baseline jitter is applied to every
+# response (not just tarpitted ones) so "delay vs no delay" stops being a
+# clean binary signal an attacker can use to detect the honeypot.
+HIGH_FREQUENCY_SCAN_THRESHOLD_MIN = int(os.environ.get("HIGH_FREQUENCY_SCAN_THRESHOLD_MIN", 4))
+HIGH_FREQUENCY_SCAN_THRESHOLD_MAX = int(os.environ.get("HIGH_FREQUENCY_SCAN_THRESHOLD_MAX", 8))
+BASELINE_JITTER_MIN_SECONDS = float(os.environ.get("BASELINE_JITTER_MIN_SECONDS", 0.05))
+BASELINE_JITTER_MAX_SECONDS = float(os.environ.get("BASELINE_JITTER_MAX_SECONDS", 0.25))
+
 # Ensure required directories exist
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(QUARANTINE_DIR, exist_ok=True)

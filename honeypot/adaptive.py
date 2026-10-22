@@ -46,6 +46,20 @@ class AdaptiveDeceptionEngine:
         # Session activity trackers
         self.session_cmd_timestamps = {}
         self.session_states = {}
+        self.session_scan_thresholds = {}  # Issue 5: per-session randomized scan-detection threshold
+
+    def _get_scan_threshold(self, session_id):
+        """Issue 5: each session gets its own randomized command-rate
+        threshold for HIGH_FREQUENCY_SCAN detection, chosen once and reused,
+        instead of a single fixed global value. A fixed threshold is
+        trivially fingerprintable -- an attacker can binary-search for the
+        exact command count where response timing changes."""
+        from honeypot.config import HIGH_FREQUENCY_SCAN_THRESHOLD_MIN, HIGH_FREQUENCY_SCAN_THRESHOLD_MAX
+        if session_id not in self.session_scan_thresholds:
+            self.session_scan_thresholds[session_id] = random.randint(
+                HIGH_FREQUENCY_SCAN_THRESHOLD_MIN, HIGH_FREQUENCY_SCAN_THRESHOLD_MAX
+            )
+        return self.session_scan_thresholds[session_id]
 
     def get_session_state(self, session_id, last_cmd, last_args, has_uploaded_file=False):
         now = time.time()
@@ -64,7 +78,7 @@ class AdaptiveDeceptionEngine:
             return "PAYLOAD_UPLOADED"
         elif last_cmd in ["RETR", "SIZE"] and any(s in (last_args or "").lower() for s in ["config.php", "passwd", "shadow", "backup"]):
             return "SENSITIVE_FILE_PROBING"
-        elif cmd_rate > 5:  # More than 5 commands in 10s = automated bot scan
+        elif cmd_rate > self._get_scan_threshold(session_id):  # Randomized per-session scan threshold
             return "HIGH_FREQUENCY_SCAN"
         else:
             return "LOW_ACTIVITY"
@@ -97,10 +111,16 @@ class AdaptiveDeceptionEngine:
             reward = 8.0
         self.update_q_value(prev_state, action, reward, state)
 
+        from honeypot.config import BASELINE_JITTER_MIN_SECONDS, BASELINE_JITTER_MAX_SECONDS
+
         result = {
             "state": state,
             "action": action,
-            "delay_seconds": 0.0,
+            # Issue 5: every response carries a small baseline jitter, not
+            # just TARPIT_DELAY responses. This removes the stark "0s vs
+            # 2-4.5s" binary signal an attacker could use to fingerprint
+            # exactly when the tarpit engaged.
+            "delay_seconds": round(random.uniform(BASELINE_JITTER_MIN_SECONDS, BASELINE_JITTER_MAX_SECONDS), 3),
             "injected_file": None,
             "fake_perm_error": False
         }

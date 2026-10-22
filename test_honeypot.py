@@ -664,5 +664,59 @@ class TestHoneypotComponents(unittest.TestCase):
         self.assertFalse(self.vfs.create_dir("/"))
 
 
+    def test_scan_threshold_randomized_per_session(self):
+        """Issue 5: the HIGH_FREQUENCY_SCAN trigger point must not be a
+        single fixed value across sessions, and must stay in range."""
+        from honeypot.adaptive import adaptive_engine
+        from honeypot.config import HIGH_FREQUENCY_SCAN_THRESHOLD_MIN, HIGH_FREQUENCY_SCAN_THRESHOLD_MAX
+
+        thresholds = set()
+        for i in range(30):
+            sid = f"scan-threshold-session-{i}"
+            t = adaptive_engine._get_scan_threshold(sid)
+            self.assertGreaterEqual(t, HIGH_FREQUENCY_SCAN_THRESHOLD_MIN)
+            self.assertLessEqual(t, HIGH_FREQUENCY_SCAN_THRESHOLD_MAX)
+            thresholds.add(t)
+        self.assertGreater(len(thresholds), 1)
+
+    def test_scan_threshold_stable_per_session(self):
+        """Issue 5: the threshold is chosen once per session and reused."""
+        from honeypot.adaptive import adaptive_engine
+        sid = "scan-threshold-stable-session"
+        t1 = adaptive_engine._get_scan_threshold(sid)
+        t2 = adaptive_engine._get_scan_threshold(sid)
+        self.assertEqual(t1, t2)
+
+    def test_baseline_jitter_applied_to_low_activity_response(self):
+        """Issue 5: even a single, ordinary command gets a small non-zero
+        baseline delay when no tarpit action is selected, so "0s" is no
+        longer a reliable "not tarpitted" tell. select_action is pinned to
+        NORMAL_RESPONSE here because it's epsilon-greedy (10% random
+        exploration regardless of state) -- without pinning it, this test
+        would be flaky, occasionally landing in the TARPIT_DELAY range by
+        chance rather than testing the baseline jitter path itself."""
+        from unittest.mock import patch
+        from honeypot.adaptive import decide_response, adaptive_engine
+        from honeypot.config import BASELINE_JITTER_MIN_SECONDS, BASELINE_JITTER_MAX_SECONDS
+        session_id = "baseline-jitter-session"
+        with patch.object(adaptive_engine, "select_action", return_value="NORMAL_RESPONSE"):
+            plan = decide_response(session_id, "NOOP", {"command": "NOOP"}, context={"vfs": self.vfs, "authenticated": True})
+        self.assertGreaterEqual(plan.delay_seconds, BASELINE_JITTER_MIN_SECONDS)
+        self.assertLessEqual(plan.delay_seconds, BASELINE_JITTER_MAX_SECONDS)
+
+    def test_high_frequency_scan_state_still_reachable(self):
+        """Issue 5: a sustained burst of commands must still eventually
+        reach HIGH_FREQUENCY_SCAN, regardless of which randomized threshold
+        this session was assigned (sending more than the configured
+        maximum guarantees it)."""
+        from honeypot.adaptive import adaptive_engine
+        from honeypot.config import HIGH_FREQUENCY_SCAN_THRESHOLD_MAX
+        sid = "scan-state-reachable-session"
+        state = "LOW_ACTIVITY"
+        for _ in range(HIGH_FREQUENCY_SCAN_THRESHOLD_MAX + 3):
+            state = adaptive_engine.get_session_state(sid, "NOOP", "", False)
+        self.assertEqual(state, "HIGH_FREQUENCY_SCAN")
+
+
 if __name__ == "__main__":
     unittest.main()
