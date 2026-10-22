@@ -151,6 +151,33 @@ class AdaptiveDeceptionEngine:
 adaptive_engine = AdaptiveDeceptionEngine()
 
 
+# Per-IP authentication trap state (module-level). Twisted's reactor is a
+# single-threaded event loop (DatabaseManager is the only piece of this
+# codebase that talks to another thread, and it has its own lock), so plain
+# dict access here is safe without additional locking.
+#
+# This exists to close two gaps in the auth trap:
+#   1. Per-session-only counters reset on every new TCP connection, so a
+#      connection-per-attempt brute forcer (e.g. Hydra in its default mode)
+#      never accumulates failures and never reaches the trap.
+#   2. A fixed "grant on attempt N" threshold is a honeypot fingerprint.
+# Each IP gets its own accumulating counter and its own randomized threshold,
+# chosen once and reused for the lifetime of that IP's entry.
+_ip_auth_state = {}
+
+
+def get_ip_auth_state(client_ip: str) -> dict:
+    """Returns (creating if needed) the per-IP auth trap state for client_ip."""
+    from honeypot.config import FAILED_ATTEMPTS_THRESHOLD_MIN, FAILED_ATTEMPTS_THRESHOLD_MAX
+    if client_ip not in _ip_auth_state:
+        _ip_auth_state[client_ip] = {
+            "failed_attempts": 0,
+            "threshold": random.randint(FAILED_ATTEMPTS_THRESHOLD_MIN, FAILED_ATTEMPTS_THRESHOLD_MAX),
+            "granted": False,
+        }
+    return _ip_auth_state[client_ip]
+
+
 class ResponsePlan:
     """
     Response Plan object returned by decide_response seam.
@@ -177,15 +204,22 @@ class ResponsePlan:
 # Autonomous Adapter Session Store (enables decide_response to be called with only 3 arguments per Job 3)
 _adapter_sessions = {}
 
-def get_adapter_session(session_id: str) -> dict:
+def get_adapter_session(session_id: str, client_ip: str = None) -> dict:
     if session_id not in _adapter_sessions:
+        from honeypot.config import FAILED_ATTEMPTS_THRESHOLD
+        ip_state = get_ip_auth_state(client_ip) if client_ip else None
         _adapter_sessions[session_id] = {
             "authenticated": False,
             "authenticated_user": None,
             "username": None,
-            "failed_attempts": 0,
+            # Seed from this attacker IP's accumulated state (if any) so a
+            # fresh connection from a known-bad IP continues where the last
+            # connection left off, instead of resetting to 0.
+            "failed_attempts": ip_state["failed_attempts"] if ip_state else 0,
+            "failed_threshold": ip_state["threshold"] if ip_state else FAILED_ATTEMPTS_THRESHOLD,
             "cwd": "/var/www",
-            "has_uploaded": False
+            "has_uploaded": False,
+            "client_ip": client_ip,
         }
     return _adapter_sessions[session_id]
 
@@ -199,7 +233,8 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
     from honeypot.config import FTP_WELCOME_BANNER, FAILED_ATTEMPTS_THRESHOLD
     from honeypot.virtual_fs import shared_vfs
 
-    sess = get_adapter_session(session_id)
+    client_ip_hint = (context or {}).get("client_ip")
+    sess = get_adapter_session(session_id, client_ip=client_ip_hint)
     if context:
         for k, v in context.items():
             if v is not None:
@@ -234,9 +269,32 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         if sess.get("authenticated", False):
             return ResponsePlan("230 Already logged in.", 230, "auth_success", delay_seconds=delay_seconds, extra={"authenticated": True})
 
+        client_ip = sess.get("client_ip")
+        ip_state = get_ip_auth_state(client_ip) if client_ip else None
+
+        # If this attacker IP already crossed its trap threshold on an
+        # earlier connection, grant access immediately rather than making
+        # it re-earn entry. This mirrors real brute-force tooling, which
+        # moves on to using credentials it believes it found, and it avoids
+        # the trap resetting to a predictable "attempt 1" on every reconnect.
+        if ip_state and ip_state.get("granted"):
+            failed_attempts = sess.get("failed_attempts", 0) + 1
+            sess["failed_attempts"] = failed_attempts
+            auth_user = parameters.get("username") or sess.get("username") or "anonymous"
+            sess["authenticated"] = True
+            sess["authenticated_user"] = auth_user
+            return ResponsePlan(
+                "230 User logged in, proceed.", 230, "auth_success",
+                delay_seconds=delay_seconds,
+                extra={"authenticated": True, "failed_attempts": failed_attempts, "authenticated_user": auth_user}
+            )
+
         failed_attempts = sess.get("failed_attempts", 0) + 1
         threshold = sess.get("failed_threshold", FAILED_ATTEMPTS_THRESHOLD)
         sess["failed_attempts"] = failed_attempts
+        if ip_state is not None:
+            ip_state["failed_attempts"] = failed_attempts
+
         if failed_attempts <= threshold:
             return ResponsePlan(
                 "530 Login incorrect.", 530, "auth_failure",
@@ -247,6 +305,8 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
             auth_user = parameters.get("username") or sess.get("username") or "anonymous"
             sess["authenticated"] = True
             sess["authenticated_user"] = auth_user
+            if ip_state is not None:
+                ip_state["granted"] = True
             return ResponsePlan(
                 "230 User logged in, proceed.", 230, "auth_success",
                 delay_seconds=delay_seconds,

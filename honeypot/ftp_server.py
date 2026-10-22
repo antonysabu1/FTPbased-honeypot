@@ -12,7 +12,7 @@ from twisted.internet.endpoints import TCP4ClientEndpoint, connectProtocol
 
 from honeypot.config import (
     FTP_HOST, FTP_PORT, PASV_PORT_MIN, PASV_PORT_MAX,
-    FAILED_ATTEMPTS_THRESHOLD, QUARANTINE_DIR, FTP_WELCOME_BANNER
+    QUARANTINE_DIR, FTP_WELCOME_BANNER
 )
 from honeypot.database import db, log_event
 from honeypot.virtual_fs import VirtualFileSystem
@@ -109,7 +109,7 @@ class FTPControlProtocol(LineReceiver):
         )
 
         # Single choke point response decision via decide_response
-        plan = decide_response(self.session_id, "CONNECT", {}, context={"vfs": vfs})
+        plan = decide_response(self.session_id, "CONNECT", {}, context={"vfs": vfs, "client_ip": self.client_ip})
 
         # Log event using exact shared contract schema
         log_event({
@@ -235,8 +235,14 @@ class FTPControlProtocol(LineReceiver):
             "authenticated": self.authenticated,
             "authenticated_user": self.authenticated_user,
             "username": self.username,
-            "failed_attempts": self.failed_attempts,
-            "failed_threshold": FAILED_ATTEMPTS_THRESHOLD,
+            # failed_attempts/failed_threshold are intentionally NOT passed
+            # here: the adaptive session seeds and owns both from per-IP
+            # state (honeypot/adaptive.py: get_adapter_session /
+            # get_ip_auth_state). self.failed_attempts is a read-only mirror
+            # updated from the PASS response in _dispatch_plan, used only
+            # for MITRE classification below; feeding it back into context
+            # would stomp the per-IP-seeded value with this protocol
+            # instance's stale local default on every command.
             "cwd": self.cwd,
             "has_uploaded": self.has_uploaded,
             "active_host": self.active_host,

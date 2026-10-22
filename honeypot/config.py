@@ -9,10 +9,15 @@ PASV_PORT_MIN = int(os.environ.get("PASV_PORT_MIN", 50000))
 PASV_PORT_MAX = int(os.environ.get("PASV_PORT_MAX", 50010))
 
 # Honeypot Auth Logic Config
-# Requires 3 failed login attempts before allowing access to any credentials.
-# Attempts 1, 2, and 3 return 530 Login incorrect.
-# Attempt 4 and beyond for a session will accept any username/password.
+# Each attacker IP is assigned a randomized failed-attempt threshold chosen
+# once from [FAILED_ATTEMPTS_THRESHOLD_MIN, FAILED_ATTEMPTS_THRESHOLD_MAX]
+# (see honeypot/adaptive.py: get_ip_auth_state). This replaces a fixed
+# "always grant on attempt 4" threshold, which was trivially fingerprintable.
+# FAILED_ATTEMPTS_THRESHOLD is kept only as a fallback default for the rare
+# case a session is created with no client IP available to seed per-IP state.
 FAILED_ATTEMPTS_THRESHOLD = int(os.environ.get("FAILED_ATTEMPTS_THRESHOLD", 3))
+FAILED_ATTEMPTS_THRESHOLD_MIN = int(os.environ.get("FAILED_ATTEMPTS_THRESHOLD_MIN", 3))
+FAILED_ATTEMPTS_THRESHOLD_MAX = int(os.environ.get("FAILED_ATTEMPTS_THRESHOLD_MAX", 7))
 
 # Storage Paths
 DATA_DIR = os.path.join(BASE_DIR, "data")

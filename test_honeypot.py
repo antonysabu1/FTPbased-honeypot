@@ -493,5 +493,104 @@ class TestHoneypotComponents(unittest.TestCase):
         self.assertEqual(plan.response_type, "unknown_command")
 
 
+    def test_per_ip_auth_tracking_survives_reconnect(self):
+        """Issue 1: Hydra-style connection-per-attempt brute forcing must still
+        reach the trap, because failures accumulate per-IP, not just per-session."""
+        from honeypot.adaptive import decide_response
+        attacker_ip = "203.0.113.50"
+
+        statuses = []
+        for i in range(4):
+            sid = f"hydra-session-{i}"
+            plan = decide_response(
+                sid, "PASS wrong",
+                {"command": "PASS", "password": "wrong"},
+                context={"vfs": self.vfs, "client_ip": attacker_ip, "failed_threshold": 3}
+            )
+            statuses.append(plan.response_status)
+
+        self.assertEqual(statuses, [530, 530, 530, 230])
+
+    def test_per_ip_auth_tracking_isolates_different_ips(self):
+        """Issue 1: a different attacker IP must have its own independent counter."""
+        from honeypot.adaptive import decide_response
+        ip_a = "198.51.100.10"
+        ip_b = "198.51.100.20"
+
+        # Drive IP A through all 3 allowed failures (threshold=3 means
+        # attempts 1-3 are still 530; only attempt 4 crosses it).
+        for i in range(3):
+            decide_response(
+                f"ip-a-session-{i}", "PASS wrong", {"command": "PASS", "password": "wrong"},
+                context={"vfs": self.vfs, "client_ip": ip_a, "failed_threshold": 3}
+            )
+
+        # IP B's first-ever attempt, on a separate session, must still be a
+        # plain first failure, unaffected by IP A's accumulated count.
+        plan_b = decide_response(
+            "ip-b-session-0", "PASS wrong", {"command": "PASS", "password": "wrong"},
+            context={"vfs": self.vfs, "client_ip": ip_b, "failed_threshold": 3}
+        )
+        self.assertEqual(plan_b.response_status, 530)
+
+        # IP A's 4th attempt (new session, same IP) crosses its threshold.
+        plan_a = decide_response(
+            "ip-a-session-3", "PASS wrong", {"command": "PASS", "password": "wrong"},
+            context={"vfs": self.vfs, "client_ip": ip_a, "failed_threshold": 3}
+        )
+        self.assertEqual(plan_a.response_status, 230)
+
+    def test_per_ip_state_grants_fast_path_on_reconnect_after_trap_sprung(self):
+        """Issue 1: once an IP has crossed its threshold, a brand new connection
+        from that same IP should be granted immediately, not reset to attempt 1."""
+        from honeypot.adaptive import decide_response
+        attacker_ip = "192.0.2.77"
+
+        for i in range(3):
+            decide_response(
+                f"sprung-session-{i}", "PASS wrong", {"command": "PASS", "password": "wrong"},
+                context={"vfs": self.vfs, "client_ip": attacker_ip, "failed_threshold": 3}
+            )
+        plan_grant = decide_response(
+            "sprung-session-3", "PASS wrong", {"command": "PASS", "password": "wrong"},
+            context={"vfs": self.vfs, "client_ip": attacker_ip, "failed_threshold": 3}
+        )
+        self.assertEqual(plan_grant.response_status, 230)
+
+        plan_reconnect = decide_response(
+            "sprung-session-reconnect", "PASS anything", {"command": "PASS", "password": "anything"},
+            context={"vfs": self.vfs, "client_ip": attacker_ip, "failed_threshold": 3}
+        )
+        self.assertEqual(plan_reconnect.response_status, 230)
+
+    def test_randomized_threshold_is_not_fixed_and_stays_in_configured_range(self):
+        """Issue 3: the per-IP threshold must not always be 3, and must fall
+        within [FAILED_ATTEMPTS_THRESHOLD_MIN, FAILED_ATTEMPTS_THRESHOLD_MAX]."""
+        from honeypot.adaptive import get_ip_auth_state
+        from honeypot.config import FAILED_ATTEMPTS_THRESHOLD_MIN, FAILED_ATTEMPTS_THRESHOLD_MAX
+
+        thresholds = set()
+        for i in range(30):
+            ip = f"203.0.113.{i}"
+            state = get_ip_auth_state(ip)
+            t = state["threshold"]
+            self.assertGreaterEqual(t, FAILED_ATTEMPTS_THRESHOLD_MIN)
+            self.assertLessEqual(t, FAILED_ATTEMPTS_THRESHOLD_MAX)
+            thresholds.add(t)
+
+        self.assertGreater(len(thresholds), 1)
+
+    def test_randomized_threshold_is_stable_per_ip(self):
+        """Issue 3: the threshold is chosen once per IP and reused, not re-rolled
+        on every lookup (otherwise accumulated failures could never cross it)."""
+        from honeypot.adaptive import get_ip_auth_state
+        ip = "203.0.113.200"
+        t1 = get_ip_auth_state(ip)["threshold"]
+        t2 = get_ip_auth_state(ip)["threshold"]
+        t3 = get_ip_auth_state(ip)["threshold"]
+        self.assertEqual(t1, t2)
+        self.assertEqual(t2, t3)
+
+
 if __name__ == "__main__":
     unittest.main()
