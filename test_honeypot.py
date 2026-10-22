@@ -440,5 +440,23 @@ class TestHoneypotComponents(unittest.TestCase):
         plan_rnto_again = decide_response(session_id, "RNTO /home/admin/again.txt", {"command": "RNTO", "path": "/home/admin/again.txt"}, context=ctx)
         self.assertEqual(plan_rnto_again.response_status, 503)
 
+    def test_appe_returns_file_append_plan(self):
+        from honeypot.adaptive import decide_response
+        session_id = "test-appe-session"
+        ctx = {"authenticated": True, "vfs": self.vfs}
+
+        plan = decide_response(session_id, "APPE /var/log/syslog", {"command": "APPE", "path": "/var/log/syslog"}, context=ctx)
+        self.assertEqual(plan.response_status, 150)
+        self.assertEqual(plan.response_type, "file_append")
+
+        plan_noauth = decide_response("test-appe-noauth", "APPE /var/log/syslog", {"command": "APPE", "path": "/var/log/syslog"}, context={"authenticated": False, "vfs": self.vfs})
+        self.assertEqual(plan_noauth.response_status, 530)
+
+    def test_abor_always_succeeds(self):
+        from honeypot.adaptive import decide_response
+        plan = decide_response("test-abor-session", "ABOR", {"command": "ABOR"}, context={"authenticated": False})
+        self.assertEqual(plan.response_status, 226)
+        self.assertEqual(plan.response_type, "abort_transfer")
+
 if __name__ == "__main__":
     unittest.main()
