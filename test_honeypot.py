@@ -797,5 +797,61 @@ class TestHoneypotComponents(unittest.TestCase):
         self.assertNotIn(session_id, engine.session_scan_thresholds)
 
 
+    def test_record_attack_signal_accumulates_score_per_ip(self):
+        """Issue 7: repeated suspicious signals from the same IP add up."""
+        from honeypot.adaptive import record_attack_signal, get_ip_attack_score
+        test_ip = "203.0.113.50"
+        record_attack_signal(test_ip, 3.0, "test:first")
+        record_attack_signal(test_ip, 4.0, "test:second")
+        self.assertEqual(get_ip_attack_score(test_ip), 7.0)
+
+    def test_record_attack_signal_escalates_once_threshold_crossed(self):
+        """Issue 7: just_escalated fires exactly once, on the call that
+        crosses the configured threshold -- not on every call after."""
+        from honeypot.adaptive import record_attack_signal
+        from honeypot.config import TRIPWIRE_ESCALATION_THRESHOLD
+        test_ip = "203.0.113.51"
+        _, escalated_early = record_attack_signal(test_ip, TRIPWIRE_ESCALATION_THRESHOLD - 1, "test:below")
+        self.assertFalse(escalated_early)
+        _, escalated_now = record_attack_signal(test_ip, 5.0, "test:crossing")
+        self.assertTrue(escalated_now)
+        _, escalated_again = record_attack_signal(test_ip, 5.0, "test:after")
+        self.assertFalse(escalated_again)
+
+    def test_is_ip_escalated_reflects_recorded_score(self):
+        """Issue 7: is_ip_escalated tracks the tripwire state set by
+        record_attack_signal."""
+        from honeypot.adaptive import record_attack_signal, is_ip_escalated
+        from honeypot.config import TRIPWIRE_ESCALATION_THRESHOLD
+        test_ip = "203.0.113.52"
+        self.assertFalse(is_ip_escalated(test_ip))
+        record_attack_signal(test_ip, TRIPWIRE_ESCALATION_THRESHOLD, "test:instant")
+        self.assertTrue(is_ip_escalated(test_ip))
+
+    def test_attack_score_isolated_per_ip(self):
+        """Issue 7: one IP's accumulated score must not leak onto another."""
+        from honeypot.adaptive import record_attack_signal, get_ip_attack_score
+        ip_a, ip_b = "203.0.113.60", "203.0.113.61"
+        record_attack_signal(ip_a, 10.0, "test:a")
+        self.assertEqual(get_ip_attack_score(ip_b), 0.0)
+        self.assertEqual(get_ip_attack_score(ip_a), 10.0)
+
+    def test_escalated_ip_never_coasts_on_normal_response(self):
+        """Issue 7: once an IP is flagged high-risk, the engine must not
+        hand it NORMAL_RESPONSE -- it's forced into heavier deception."""
+        from honeypot.adaptive import AdaptiveDeceptionEngine, record_attack_signal
+        from honeypot.config import TRIPWIRE_ESCALATION_THRESHOLD
+        engine = AdaptiveDeceptionEngine()
+        test_ip = "203.0.113.70"
+        record_attack_signal(test_ip, TRIPWIRE_ESCALATION_THRESHOLD, "test:preescalated")
+
+        for i in range(10):
+            result = engine.evaluate_response(
+                f"escalated-session-{i}", "PWD", "", self.vfs,
+                has_uploaded=False, client_ip=test_ip
+            )
+            self.assertNotEqual(result["action"], "NORMAL_RESPONSE")
+
+
 if __name__ == "__main__":
     unittest.main()

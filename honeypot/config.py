@@ -50,6 +50,14 @@ HIGH_FREQUENCY_SCAN_THRESHOLD_MAX = int(os.environ.get("HIGH_FREQUENCY_SCAN_THRE
 BASELINE_JITTER_MIN_SECONDS = float(os.environ.get("BASELINE_JITTER_MIN_SECONDS", 0.05))
 BASELINE_JITTER_MAX_SECONDS = float(os.environ.get("BASELINE_JITTER_MAX_SECONDS", 0.25))
 
+# Per-IP tripwire / escalation (Issue 7). Accumulates a weighted attack
+# score per source IP, independent of (and surviving across) individual
+# sessions, and flags the IP as high-risk once the score crosses this
+# threshold. Escalation doesn't block the attacker -- a hard block just
+# sends them elsewhere -- it biases the adaptive engine toward heavier
+# deception for that IP for the rest of the engagement.
+TRIPWIRE_ESCALATION_THRESHOLD = float(os.environ.get("TRIPWIRE_ESCALATION_THRESHOLD", 12.0))
+
 # Ensure required directories exist
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(QUARANTINE_DIR, exist_ok=True)

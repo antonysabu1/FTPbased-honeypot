@@ -128,7 +128,7 @@ class AdaptiveDeceptionEngine:
 
         return reward
 
-    def evaluate_response(self, session_id, command, args, vfs_instance, has_uploaded=False):
+    def evaluate_response(self, session_id, command, args, vfs_instance, has_uploaded=False, client_ip=None):
         """
         Determines response modification (delay, dynamic file creation, or
         response code modification) for the CURRENT command, and closes the
@@ -143,8 +143,12 @@ class AdaptiveDeceptionEngine:
             "injected_paths": set(),
             "pending_state": None,
             "pending_action": None,
+            "client_ip": None,
         })
         qlearn["cmd_count"] += 1
+        if client_ip:
+            qlearn["client_ip"] = client_ip
+        ip_for_scoring = qlearn.get("client_ip")
 
         # Close the loop on the PREVIOUS action now that its consequence
         # (this command) is observable, then compute the CURRENT state.
@@ -156,7 +160,35 @@ class AdaptiveDeceptionEngine:
             state = self.get_session_state(session_id, command, args, has_uploaded)
 
         self.session_states[session_id] = state
+
+        # Issue 7: per-IP tripwire scoring. Independent of per-session
+        # state, so it accumulates across reconnects from the same
+        # attacker (unlike session_states, which resets per session).
+        if ip_for_scoring:
+            score_points = 0.0
+            if state == "PAYLOAD_UPLOADED":
+                score_points = 6.0
+            elif state == "SENSITIVE_FILE_PROBING":
+                score_points = 3.0
+            elif state == "HIGH_FREQUENCY_SCAN":
+                score_points = 1.0
+            cmd_upper = (command or "").upper()
+            if cmd_upper in ["DELE", "RMD"]:
+                score_points += 2.0
+            if cmd_upper == "STOR" and any(ext in (args or "").lower() for ext in [".php", ".sh", ".py", ".pl", ".exe", ".elf", ".asp", ".jsp"]):
+                score_points += 3.0
+            if score_points:
+                new_score, just_escalated = record_attack_signal(ip_for_scoring, score_points, f"{cmd_upper}:{state}")
+                if just_escalated:
+                    logger.warning(f"[Tripwire] IP {ip_for_scoring} escalated to HIGH RISK (score={new_score:.1f})")
+
         action = self.select_action(state)
+
+        # Issue 7: an attacker whose IP has already crossed the tripwire
+        # threshold doesn't get to coast on NORMAL_RESPONSE -- force
+        # heavier deception for the rest of the engagement.
+        if ip_for_scoring and is_ip_escalated(ip_for_scoring) and action == "NORMAL_RESPONSE":
+            action = random.choice(["TARPIT_DELAY", "DYNAMIC_INJECTION"])
 
         # Stash this turn's (state, action) so the NEXT call can reward it
         # once its actual consequence has been observed.
@@ -246,6 +278,51 @@ class AdaptiveDeceptionEngine:
         self.session_states.pop(session_id, None)
         self.session_scan_thresholds.pop(session_id, None)
         self.session_qlearn.pop(session_id, None)
+
+
+# Issue 7: Per-IP tripwire / escalation. Tracks an accumulating "attack
+# score" per source IP across reconnects (independent of per-session
+# state, which resets every session), and flags an IP as escalated once
+# the score crosses a configurable threshold.
+_ip_escalation = {}
+
+
+def record_attack_signal(client_ip, points, reason):
+    """Add `points` to client_ip's accumulated attack score. Returns
+    (new_score, just_escalated) -- just_escalated is True only on the
+    single call that crosses the threshold, so callers can fire a
+    one-time escalation alert instead of re-alerting on every later
+    command from the same already-flagged IP."""
+    from honeypot.config import TRIPWIRE_ESCALATION_THRESHOLD
+
+    if not client_ip:
+        return 0.0, False
+
+    record = _ip_escalation.setdefault(client_ip, {"score": 0.0, "escalated": False, "reasons": []})
+    record["score"] += points
+    record["reasons"].append(reason)
+
+    just_escalated = False
+    if not record["escalated"] and record["score"] >= TRIPWIRE_ESCALATION_THRESHOLD:
+        record["escalated"] = True
+        just_escalated = True
+
+    return record["score"], just_escalated
+
+
+def is_ip_escalated(client_ip):
+    """Whether this IP has already crossed the tripwire threshold."""
+    if not client_ip:
+        return False
+    return _ip_escalation.get(client_ip, {}).get("escalated", False)
+
+
+def get_ip_attack_score(client_ip):
+    """Current accumulated attack score for an IP (0.0 if unseen)."""
+    if not client_ip:
+        return 0.0
+    return _ip_escalation.get(client_ip, {}).get("score", 0.0)
+
 
 adaptive_engine = AdaptiveDeceptionEngine()
 
@@ -355,7 +432,7 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
     # Query Adaptive Deception Engine for delay & dynamic injection
     delay_seconds = 0.0
     if vfs_instance:
-        adaptive_eval = adaptive_engine.evaluate_response(session_id, cmd, raw_args, vfs_instance, has_uploaded)
+        adaptive_eval = adaptive_engine.evaluate_response(session_id, cmd, raw_args, vfs_instance, has_uploaded, client_ip=client_ip_hint)
         delay_seconds = adaptive_eval.get("delay_seconds", 0.0)
 
     # Response decision mapping
