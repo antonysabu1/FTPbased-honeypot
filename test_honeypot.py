@@ -399,5 +399,23 @@ class TestHoneypotComponents(unittest.TestCase):
         plan_bad = decide_response(session_id, "OPTS FOO BAR", {"command": "OPTS", "raw_args": "FOO BAR"})
         self.assertEqual(plan_bad.response_status, 501)
 
+    def test_mdtm_file_time(self):
+        from honeypot.adaptive import decide_response
+        session_id = "test-mdtm-session"
+        ctx = {"authenticated": True, "vfs": self.vfs}
+
+        plan_ok = decide_response(session_id, "MDTM /var/www/config.php", {"command": "MDTM", "path": "/var/www/config.php"}, context=ctx)
+        self.assertEqual(plan_ok.response_status, 213)
+        parts = plan_ok.response_text.split()
+        self.assertEqual(parts[0], "213")
+        self.assertTrue(parts[1].isdigit())
+        self.assertEqual(len(parts[1]), 14)
+
+        plan_missing = decide_response(session_id, "MDTM /no/such/file", {"command": "MDTM", "path": "/no/such/file"}, context=ctx)
+        self.assertEqual(plan_missing.response_status, 550)
+
+        plan_noauth = decide_response("test-mdtm-noauth", "MDTM /var/www/config.php", {"command": "MDTM", "path": "/var/www/config.php"}, context={"authenticated": False, "vfs": self.vfs})
+        self.assertEqual(plan_noauth.response_status, 530)
+
 if __name__ == "__main__":
     unittest.main()
