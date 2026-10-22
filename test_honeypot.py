@@ -381,5 +381,23 @@ class TestHoneypotComponents(unittest.TestCase):
         for feature in ["EPSV", "MDTM", "TVFS", "PASV", "UTF8", "SIZE"]:
             self.assertIn(feature, plan.response_text)
 
+    def test_auth_pbsz_prot_rejected_as_not_implemented(self):
+        from honeypot.adaptive import decide_response
+        for cmd in ["AUTH TLS", "PBSZ 0", "PROT P"]:
+            parts = cmd.split(" ", 1)
+            plan = decide_response("test-tls-session", cmd, {"command": parts[0], "raw_args": parts[1] if len(parts) > 1 else ""})
+            self.assertEqual(plan.response_status, 502, f"{cmd} should return 502 Not Implemented")
+            self.assertEqual(plan.response_type, "tls_not_supported")
+
+    def test_opts_utf8(self):
+        from honeypot.adaptive import decide_response
+        session_id = "test-opts-session"
+
+        plan_ok = decide_response(session_id, "OPTS UTF8 ON", {"command": "OPTS", "raw_args": "UTF8 ON"})
+        self.assertEqual(plan_ok.response_status, 200)
+
+        plan_bad = decide_response(session_id, "OPTS FOO BAR", {"command": "OPTS", "raw_args": "FOO BAR"})
+        self.assertEqual(plan_bad.response_status, 501)
+
 if __name__ == "__main__":
     unittest.main()
