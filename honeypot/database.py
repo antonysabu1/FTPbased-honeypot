@@ -125,7 +125,7 @@ class DatabaseManager:
         - response_type: str
         """
         event_id = str(event_data.get("event_id") or uuid.uuid4())
-        timestamp = str(event_data.get("timestamp") or (datetime.datetime.utcnow().isoformat() + "Z"))
+        timestamp = str(event_data.get("timestamp") or (datetime.datetime.now(datetime.UTC).isoformat() + "Z"))
         protocol = str(event_data.get("protocol") or "ftp")
         source_ip = str(event_data.get("source_ip") or "0.0.0.0")
         session_id = str(event_data.get("session_id") or "")
@@ -159,7 +159,7 @@ class DatabaseManager:
         return event_id
 
     def create_session(self, session_id, client_ip, client_port, geo_info=None, abuse_score=0):
-        now = datetime.datetime.utcnow().isoformat()
+        now = datetime.datetime.now(datetime.UTC).isoformat()
         geo = geo_info or {}
         with self._lock:
             conn = self.get_connection()
@@ -204,7 +204,7 @@ class DatabaseManager:
             conn.close()
 
     def close_session(self, session_id):
-        now = datetime.datetime.utcnow().isoformat()
+        now = datetime.datetime.now(datetime.UTC).isoformat()
         with self._lock:
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -217,7 +217,7 @@ class DatabaseManager:
             conn.close()
 
     def log_auth_attempt(self, session_id, client_ip, username, password, success, attempt_number):
-        now = datetime.datetime.utcnow().isoformat()
+        now = datetime.datetime.now(datetime.UTC).isoformat()
         with self._lock:
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -229,7 +229,7 @@ class DatabaseManager:
             conn.close()
 
     def log_command(self, session_id, client_ip, command, arguments, response_code=None, mitre_technique=""):
-        now = datetime.datetime.utcnow().isoformat()
+        now = datetime.datetime.now(datetime.UTC).isoformat()
         with self._lock:
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -241,7 +241,7 @@ class DatabaseManager:
             conn.close()
 
     def log_quarantined_file(self, session_id, client_ip, original_filename, quarantine_filename, file_size, sha256_hash, yara_matches=""):
-        now = datetime.datetime.utcnow().isoformat()
+        now = datetime.datetime.now(datetime.UTC).isoformat()
         with self._lock:
             conn = self.get_connection()
             cursor = conn.cursor()
