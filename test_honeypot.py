@@ -362,5 +362,24 @@ class TestHoneypotComponents(unittest.TestCase):
         self.assertFalse(os.path.exists("C:\\var\\www\\test_isolation.txt"))
 
 
+    def test_epsv_response(self):
+        from honeypot.adaptive import decide_response
+        ctx = {"authenticated": True, "pasv_str": "229 Entering Extended Passive Mode (|||50003|)."}
+
+        plan = decide_response("test-epsv-session", "EPSV", {"command": "EPSV", "raw_args": ""}, context=ctx)
+        self.assertEqual(plan.response_status, 229)
+        self.assertEqual(plan.response_type, "extended_passive_mode")
+        self.assertIn("Extended Passive Mode", plan.response_text)
+
+        plan_noauth = decide_response("test-epsv-noauth", "EPSV", {"command": "EPSV"}, context={"authenticated": False})
+        self.assertEqual(plan_noauth.response_status, 530)
+
+    def test_feat_advertises_new_capabilities(self):
+        from honeypot.adaptive import decide_response
+        plan = decide_response("test-feat-session", "FEAT", {"command": "FEAT"})
+        self.assertEqual(plan.response_status, 211)
+        for feature in ["EPSV", "MDTM", "TVFS", "PASV", "UTF8", "SIZE"]:
+            self.assertIn(feature, plan.response_text)
+
 if __name__ == "__main__":
     unittest.main()
