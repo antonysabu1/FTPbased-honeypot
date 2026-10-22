@@ -4,9 +4,27 @@ Implements a Finite State Machine (FSM) & Reinforcement Learning (Q-table) Tarpi
 """
 import time
 import random
+import posixpath
 import logging
 
 logger = logging.getLogger("AegisFTP.Adaptive")
+
+# Issue 6: sensitive-file containment. These keywords match the same bait
+# assets the rest of the engine already treats as "sensitive" (see
+# get_session_state's SENSITIVE_FILE_PROBING check and mitre_mapper's
+# CREDENTIAL_DUMPING mapping), so a RETR on any of them is gated behind a
+# simple behavioral trigger: the attacker must have already listed the
+# containing directory in this session. This isn't a real security boundary
+# (it's a deception control, not an ACL) -- it just stops a scripted
+# "connect, auth, RETR /etc/shadow" one-liner from reaching the bait on the
+# very first request, which is more realistic and buys more dwell time.
+SENSITIVE_PROBE_KEYWORDS = ["passwd", "shadow", "config.php", "backup"]
+
+
+def _is_sensitive_path(path_or_name):
+    lowered = (path_or_name or "").lower()
+    return any(k in lowered for k in SENSITIVE_PROBE_KEYWORDS)
+
 
 class AdaptiveDeceptionEngine:
     def __init__(self):
@@ -220,6 +238,10 @@ def get_adapter_session(session_id: str, client_ip: str = None) -> dict:
             "cwd": "/var/www",
             "has_uploaded": False,
             "client_ip": client_ip,
+            # Issue 6: post-authentication containment state.
+            "listed_dirs": set(),
+            "destructive_op_count": 0,
+            "stor_count": 0,
         }
     return _adapter_sessions[session_id]
 
@@ -230,7 +252,7 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
     Complies with Adapter Contract Job 3: single choke point seam.
     Can be called as decide_response(session_id, action, parameters).
     """
-    from honeypot.config import FTP_WELCOME_BANNER, FAILED_ATTEMPTS_THRESHOLD
+    from honeypot.config import FTP_WELCOME_BANNER, FAILED_ATTEMPTS_THRESHOLD, MAX_DESTRUCTIVE_OPS_PER_SESSION
     from honeypot.virtual_fs import shared_vfs
 
     client_ip_hint = (context or {}).get("client_ip")
@@ -395,6 +417,16 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
     elif cmd in ["LIST", "NLST"]:
         if not sess.get("authenticated", False):
             return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        cwd = sess.get("cwd", "/var/www")
+        list_target = parameters.get("path") or raw_args.strip()
+        if list_target and not list_target.startswith("-"):
+            listing_path = vfs_instance.normalize_path(cwd, list_target) if vfs_instance else cwd
+        else:
+            listing_path = cwd
+        # Issue 6: record that this directory has now been "discovered" by
+        # the attacker, which is the behavioral trigger that unlocks RETR
+        # on any sensitive file inside it (see the RETR handler below).
+        sess.setdefault("listed_dirs", set()).add(listing_path)
         return ResponsePlan("150 Here comes the directory listing.", 150, "directory_listing", delay_seconds=delay_seconds)
 
     elif cmd == "RETR":
@@ -408,6 +440,14 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         cwd = sess.get("cwd", "/var/www")
         if vfs_instance:
             target_path = vfs_instance.normalize_path(cwd, filename)
+            # Issue 6: sensitive bait files require the attacker to have
+            # already listed their containing directory in this session --
+            # a scripted "connect, auth, grab /etc/shadow" one-liner that
+            # never looks around first gets a plain permission error.
+            if _is_sensitive_path(target_path):
+                parent_dir = posixpath.dirname(target_path) or "/"
+                if parent_dir not in sess.get("listed_dirs", set()):
+                    return ResponsePlan("550 Permission denied.", 550, "permission_denied", delay_seconds=delay_seconds)
             content = vfs_instance.get_file_content(target_path)
             if content is not None:
                 return ResponsePlan(
@@ -422,12 +462,19 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         filename = parameters.get("path") or parameters.get("filename") or raw_args.strip()
         if not filename:
             return ResponsePlan("501 Syntax error, filename required.", 501, "syntax_error", delay_seconds=delay_seconds)
+        # Issue 6: cap uploads per session so a scripted mass-upload can't
+        # fill the fake filesystem indefinitely, while staying interactive
+        # up to that point.
+        stor_count = sess.get("stor_count", 0)
+        if stor_count >= MAX_DESTRUCTIVE_OPS_PER_SESSION:
+            return ResponsePlan("452 Insufficient storage space, upload quota exceeded.", 452, "quota_exceeded", delay_seconds=delay_seconds)
         cwd = sess.get("cwd", "/var/www")
         if vfs_instance:
             target_path = vfs_instance.normalize_path(cwd, filename)
             target_node = vfs_instance.get_node(target_path)
             if target_node and target_node.is_dir:
                 return ResponsePlan("553 Target is a directory.", 553, "file_error", delay_seconds=delay_seconds)
+        sess["stor_count"] = stor_count + 1
         return ResponsePlan("150 Ok to send data.", 150, "file_upload", delay_seconds=delay_seconds)
 
     elif cmd == "SIZE":
@@ -449,6 +496,12 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         filename = parameters.get("path") or parameters.get("filename") or raw_args.strip()
         if not filename:
             return ResponsePlan("501 Syntax error, filename required.", 501, "syntax_error", delay_seconds=delay_seconds)
+        # Issue 6: cap destructive operations (DELE + RMD share this budget)
+        # per session so a scripted wipe can't destroy the whole fake
+        # filesystem, while staying interactive up to that point.
+        destructive_count = sess.get("destructive_op_count", 0)
+        if destructive_count >= MAX_DESTRUCTIVE_OPS_PER_SESSION:
+            return ResponsePlan("550 Permission denied.", 550, "destructive_limit_reached", delay_seconds=delay_seconds)
         if vfs_instance:
             target_path = vfs_instance.normalize_path(cwd, filename)
             node = vfs_instance.get_node(target_path)
@@ -459,6 +512,7 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
             else:
                 removed = vfs_instance.remove_node(target_path)
             if removed:
+                sess["destructive_op_count"] = destructive_count + 1
                 return ResponsePlan("250 Delete operation successful.", 250, "file_delete", delay_seconds=delay_seconds)
         return ResponsePlan("550 File not found.", 550, "file_error", delay_seconds=delay_seconds)
 
@@ -484,6 +538,10 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         target = parameters.get("path") or raw_args.strip()
         if not target:
             return ResponsePlan("501 Syntax error, directory name required.", 501, "syntax_error", delay_seconds=delay_seconds)
+        # Issue 6: shares the destructive-op budget with DELE.
+        destructive_count = sess.get("destructive_op_count", 0)
+        if destructive_count >= MAX_DESTRUCTIVE_OPS_PER_SESSION:
+            return ResponsePlan("550 Permission denied.", 550, "destructive_limit_reached", delay_seconds=delay_seconds)
         if vfs_instance:
             target_path = vfs_instance.normalize_path(cwd, target)
             node = vfs_instance.get_node(target_path)
@@ -496,6 +554,7 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
             else:
                 removed = vfs_instance.remove_node(target_path)
             if removed:
+                sess["destructive_op_count"] = destructive_count + 1
                 return ResponsePlan("250 Remove directory operation successful.", 250, "directory_remove", delay_seconds=delay_seconds)
         return ResponsePlan("550 Directory not found.", 550, "directory_error", delay_seconds=delay_seconds)
 
@@ -578,12 +637,17 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         filename = parameters.get("path") or raw_args.strip()
         if not filename:
             return ResponsePlan("501 Syntax error, filename required.", 501, "syntax_error", delay_seconds=delay_seconds)
+        # Issue 6: shares the upload budget with STOR.
+        stor_count = sess.get("stor_count", 0)
+        if stor_count >= MAX_DESTRUCTIVE_OPS_PER_SESSION:
+            return ResponsePlan("452 Insufficient storage space, upload quota exceeded.", 452, "quota_exceeded", delay_seconds=delay_seconds)
         cwd = sess.get("cwd", "/var/www")
         if vfs_instance:
             target_path = vfs_instance.normalize_path(cwd, filename)
             target_node = vfs_instance.get_node(target_path)
             if target_node and target_node.is_dir:
                 return ResponsePlan("553 Target is a directory.", 553, "file_error", delay_seconds=delay_seconds)
+        sess["stor_count"] = stor_count + 1
         return ResponsePlan("150 Ok to send data.", 150, "file_append", delay_seconds=delay_seconds)
 
     elif cmd == "ABOR":

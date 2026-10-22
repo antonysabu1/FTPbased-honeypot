@@ -289,6 +289,11 @@ class TestHoneypotComponents(unittest.TestCase):
         self.assertEqual(plan_pwd2.response_status, 257)
         self.assertIn("/etc", plan_pwd2.response_text)
 
+        # 6a. LIST the directory first -- Issue 6's containment gate requires
+        # this "discovery" step before a sensitive bait file (passwd) can be
+        # RETR'd, so a scripted one-liner can't grab it on the first try.
+        decide_response(session_id, "LIST", {"command": "LIST", "raw_args": ""})
+
         # 7. RETR file in /etc
         plan_retr = decide_response(session_id, "RETR passwd", {"command": "RETR", "path": "passwd"})
         self.assertEqual(plan_retr.response_status, 150)
@@ -590,6 +595,73 @@ class TestHoneypotComponents(unittest.TestCase):
         t3 = get_ip_auth_state(ip)["threshold"]
         self.assertEqual(t1, t2)
         self.assertEqual(t2, t3)
+
+
+    def test_retr_sensitive_file_requires_directory_listing_first(self):
+        """Issue 6: a scripted connect-auth-grab-passwd one-liner should not
+        get the bait file on the very first RETR; it must LIST the
+        directory first, matching how an attacker that looks around behaves."""
+        from honeypot.adaptive import decide_response
+        session_id = "test-sensitive-gate-session"
+        ctx = {"authenticated": True, "vfs": self.vfs, "cwd": "/etc"}
+
+        plan_blocked = decide_response(session_id, "RETR passwd", {"command": "RETR", "path": "passwd"}, context=ctx)
+        self.assertEqual(plan_blocked.response_status, 550)
+
+        decide_response(session_id, "LIST", {"command": "LIST", "raw_args": ""}, context=ctx)
+
+        plan_allowed = decide_response(session_id, "RETR passwd", {"command": "RETR", "path": "passwd"}, context=ctx)
+        self.assertEqual(plan_allowed.response_status, 150)
+
+    def test_retr_non_sensitive_file_unaffected_by_listing_gate(self):
+        """Issue 6: the containment gate must only apply to sensitive bait
+        files; ordinary files remain accessible on the very first RETR."""
+        from honeypot.adaptive import decide_response
+        session_id = "test-nonsensitive-gate-session"
+        ctx = {"authenticated": True, "vfs": self.vfs, "cwd": "/home/admin"}
+        plan = decide_response(session_id, "RETR readme.txt", {"command": "RETR", "path": "readme.txt"}, context=ctx)
+        self.assertEqual(plan.response_status, 150)
+
+    def test_destructive_op_limit_on_dele_and_rmd(self):
+        """Issue 6: DELE/RMD share a per-session destructive-op budget; once
+        exceeded, further attempts are denied instead of mutating the VFS."""
+        from honeypot.adaptive import decide_response
+        from honeypot.config import MAX_DESTRUCTIVE_OPS_PER_SESSION
+        session_id = "test-destructive-limit-session"
+        ctx = {"authenticated": True, "vfs": self.vfs, "cwd": "/tmp"}
+
+        for i in range(MAX_DESTRUCTIVE_OPS_PER_SESSION):
+            self.vfs.add_file(f"/tmp/junk{i}.txt", b"x")
+            plan = decide_response(session_id, f"DELE junk{i}.txt", {"command": "DELE", "path": f"junk{i}.txt"}, context=ctx)
+            self.assertEqual(plan.response_status, 250)
+
+        self.vfs.add_file("/tmp/one_too_many.txt", b"x")
+        plan_denied = decide_response(session_id, "DELE one_too_many.txt", {"command": "DELE", "path": "one_too_many.txt"}, context=ctx)
+        self.assertEqual(plan_denied.response_status, 550)
+        self.assertIsNotNone(self.vfs.get_file_content("/tmp/one_too_many.txt"))
+
+    def test_stor_quota_limit(self):
+        """Issue 6: STOR/APPE share a per-session upload budget; once
+        exceeded, the server reports a quota error instead of accepting
+        more data."""
+        from honeypot.adaptive import decide_response
+        from honeypot.config import MAX_DESTRUCTIVE_OPS_PER_SESSION
+        session_id = "test-stor-quota-session"
+        ctx = {"authenticated": True, "vfs": self.vfs, "cwd": "/tmp"}
+
+        for i in range(MAX_DESTRUCTIVE_OPS_PER_SESSION):
+            plan = decide_response(session_id, f"STOR payload{i}.bin", {"command": "STOR", "path": f"payload{i}.bin"}, context=ctx)
+            self.assertEqual(plan.response_status, 150)
+
+        plan_denied = decide_response(session_id, "STOR one_too_many.bin", {"command": "STOR", "path": "one_too_many.bin"}, context=ctx)
+        self.assertEqual(plan_denied.response_status, 452)
+
+    def test_vfs_root_protected_from_destructive_operations(self):
+        """Issue 6: operations targeting the VFS root must never succeed."""
+        self.assertFalse(self.vfs.remove_file("/"))
+        self.assertFalse(self.vfs.remove_dir("/"))
+        self.assertFalse(self.vfs.remove_node("/"))
+        self.assertFalse(self.vfs.create_dir("/"))
 
 
 if __name__ == "__main__":

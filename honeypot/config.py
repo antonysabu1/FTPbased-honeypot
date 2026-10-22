@@ -32,6 +32,14 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "ftp-honeypot-secret-key-2026")
 # Server Banner
 FTP_WELCOME_BANNER = os.environ.get("FTP_WELCOME_BANNER", "220 ProFTPD 1.3.5a Server (Debian FTP Server)")
 
+# Post-authentication containment (Issue 6): caps on destructive VFS
+# operations per session. DELE + RMD share one budget, STOR + APPE share
+# another. Once exceeded, the honeypot returns a realistic-looking error
+# instead of performing the operation, so a scripted wipe/mass-upload can't
+# actually destroy or flood the fake filesystem while the session otherwise
+# stays interactive.
+MAX_DESTRUCTIVE_OPS_PER_SESSION = int(os.environ.get("MAX_DESTRUCTIVE_OPS_PER_SESSION", 10))
+
 # Ensure required directories exist
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(QUARANTINE_DIR, exist_ok=True)
