@@ -417,5 +417,28 @@ class TestHoneypotComponents(unittest.TestCase):
         plan_noauth = decide_response("test-mdtm-noauth", "MDTM /var/www/config.php", {"command": "MDTM", "path": "/var/www/config.php"}, context={"authenticated": False, "vfs": self.vfs})
         self.assertEqual(plan_noauth.response_status, 530)
 
+    def test_rnfr_rnto_rename_flow(self):
+        from honeypot.adaptive import decide_response
+        session_id = "test-rename-session"
+        ctx = {"authenticated": True, "vfs": self.vfs}
+
+        plan_bad_seq = decide_response(session_id, "RNTO /home/admin/x.txt", {"command": "RNTO", "path": "/home/admin/x.txt"}, context=ctx)
+        self.assertEqual(plan_bad_seq.response_status, 503)
+
+        plan_rnfr_missing = decide_response(session_id, "RNFR /no/such/file", {"command": "RNFR", "path": "/no/such/file"}, context=ctx)
+        self.assertEqual(plan_rnfr_missing.response_status, 550)
+
+        plan_rnfr = decide_response(session_id, "RNFR /home/admin/readme.txt", {"command": "RNFR", "path": "/home/admin/readme.txt"}, context=ctx)
+        self.assertEqual(plan_rnfr.response_status, 350)
+
+        plan_rnto = decide_response(session_id, "RNTO /home/admin/renamed.txt", {"command": "RNTO", "path": "/home/admin/renamed.txt"}, context=ctx)
+        self.assertEqual(plan_rnto.response_status, 250)
+
+        self.assertIsNone(self.vfs.get_file_content("/home/admin/readme.txt"))
+        self.assertIsNotNone(self.vfs.get_file_content("/home/admin/renamed.txt"))
+
+        plan_rnto_again = decide_response(session_id, "RNTO /home/admin/again.txt", {"command": "RNTO", "path": "/home/admin/again.txt"}, context=ctx)
+        self.assertEqual(plan_rnto_again.response_status, 503)
+
 if __name__ == "__main__":
     unittest.main()
